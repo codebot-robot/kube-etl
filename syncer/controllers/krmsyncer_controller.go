@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
@@ -480,6 +481,9 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				destClient, err = r.getRemoteClient(ctx, &krmsyncer)
 				if err != nil {
 					logger.Error(err, "Failed to get remote client")
+					if updateErr := r.updateSyncStatus(ctx, &krmsyncer, err); updateErr != nil {
+						logger.Error(updateErr, "Failed to update KRMSyncer status")
+					}
 					continue
 				}
 			} else {
@@ -496,8 +500,18 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				logger.Info("Deleting resource on destination cluster", "name", req.Name, "namespace", req.Namespace)
 				if err := destClient.Delete(ctx, toDelete); err != nil {
 					if !errors.IsNotFound(err) {
-						// TODO: report failure in syncer status
 						logger.Error(err, "Failed to delete resource on destination cluster")
+						if updateErr := r.updateSyncStatus(ctx, &krmsyncer, err); updateErr != nil {
+							logger.Error(updateErr, "Failed to update KRMSyncer status")
+						}
+					} else {
+						if updateErr := r.updateSyncStatus(ctx, &krmsyncer, nil); updateErr != nil {
+							logger.Error(updateErr, "Failed to update KRMSyncer status")
+						}
+					}
+				} else {
+					if updateErr := r.updateSyncStatus(ctx, &krmsyncer, nil); updateErr != nil {
+						logger.Error(updateErr, "Failed to update KRMSyncer status")
 					}
 				}
 				continue
@@ -509,8 +523,10 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			syncFields := rule.SyncFields
 			destObj, err := r.filterFields(u, syncFields)
 			if err != nil {
-				// TODO: report failure in syncer status
 				logger.Error(err, "Failed to filter fields")
+				if updateErr := r.updateSyncStatus(ctx, &krmsyncer, err); updateErr != nil {
+					logger.Error(updateErr, "Failed to update KRMSyncer status")
+				}
 				continue
 			}
 
@@ -521,14 +537,47 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			destObj.SetManagedFields(nil)
 
 			if err := r.applyToDestination(ctx, destClient, destObj); err != nil {
-				// TODO: report failure in syncer status
 				logger.Error(err, "Failed to apply to destination cluster")
+				if updateErr := r.updateSyncStatus(ctx, &krmsyncer, err); updateErr != nil {
+					logger.Error(updateErr, "Failed to update KRMSyncer status")
+				}
 			} else {
 				logger.Info("Successfully synced resource to destination cluster", "name", u.GetName(), "namespace", u.GetNamespace())
+				if updateErr := r.updateSyncStatus(ctx, &krmsyncer, nil); updateErr != nil {
+					logger.Error(updateErr, "Failed to update KRMSyncer status")
+				}
 			}
 		}
 	}
 	return ctrl.Result{}, nil
+}
+
+func (r *DynamicResourceReconciler) updateSyncStatus(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer, syncErr error) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &krmv1alpha1.KRMSyncer{}
+		key := client.ObjectKey{Name: krmsyncer.Name, Namespace: krmsyncer.Namespace}
+		if err := r.LocalClient.Get(ctx, key, latest); err != nil {
+			return err
+		}
+
+		if syncErr != nil {
+			meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+				Type:    "Synced",
+				Status:  metav1.ConditionFalse,
+				Reason:  "SyncFailed",
+				Message: syncErr.Error(),
+			})
+		} else {
+			meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+				Type:    "Synced",
+				Status:  metav1.ConditionTrue,
+				Reason:  "SyncSucceeded",
+				Message: "All sync operations are succeeding",
+			})
+		}
+
+		return r.LocalClient.Status().Update(ctx, latest)
+	})
 }
 
 func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {

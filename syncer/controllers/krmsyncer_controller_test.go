@@ -653,3 +653,98 @@ func createKubeconfig(cfg *rest.Config) ([]byte, error) {
 
 	return clientcmd.Write(config)
 }
+
+func TestSyncerSyncStatusReporting(t *testing.T) {
+	ctx := t.Context()
+	nsSuccess := "default"
+	nsFail := "non-existent-ns-test"
+	secretName := "status-reporting-kubeconfig"
+	syncerName := "status-reporting-syncer"
+	targetServiceName := "status-service"
+
+	destKubeconfigContent, err := createKubeconfig(cfgDest)
+	require.NoError(t, err)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: nsSuccess},
+		Data:       map[string][]byte{"kubeconfig": destKubeconfigContent},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, secret))
+
+	// 1. Success Case
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: nsSuccess},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Suspend: false,
+			Mode:    krmv1alpha1.ModePush,
+			Remote: &krmv1alpha1.RemoteConfig{
+				ClusterConfig: &krmv1alpha1.ClusterConfig{
+					KubeConfigSecretRef: &corev1.SecretReference{Name: secretName, Namespace: nsSuccess},
+				},
+			},
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "", Version: "v1", Kind: "Service",
+					Namespaces: []string{nsSuccess, nsFail},
+					SyncFields: []string{"spec"},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+
+	// Create success target Service in source
+	targetSuccess := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: nsSuccess},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 80}},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, targetSuccess))
+
+	// Verify Service Sync to Dest & Syncer reports Synced = True
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		latestSyncer := &krmv1alpha1.KRMSyncer{}
+		if err := k8sClientSource.Get(ctx, types.NamespacedName{Name: syncerName, Namespace: nsSuccess}, latestSyncer); err != nil {
+			return false, err
+		}
+		for _, cond := range latestSyncer.Status.Conditions {
+			if cond.Type == "Synced" && cond.Status == metav1.ConditionTrue {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	assert.NoError(t, err, "Syncer status should report Synced=True after a successful sync")
+
+	// 2. Failure Case
+	// Create the namespace in Source, but NOT in Dest
+	failNamespace := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: nsFail},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, failNamespace))
+
+	// Create target Service in the fail namespace in source
+	targetFail := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: nsFail},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 80}},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, targetFail))
+
+	// Verify Service Sync fails & Syncer reports Synced = False
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		latestSyncer := &krmv1alpha1.KRMSyncer{}
+		if err := k8sClientSource.Get(ctx, types.NamespacedName{Name: syncerName, Namespace: nsSuccess}, latestSyncer); err != nil {
+			return false, err
+		}
+		for _, cond := range latestSyncer.Status.Conditions {
+			if cond.Type == "Synced" && cond.Status == metav1.ConditionFalse && cond.Reason == "SyncFailed" {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	assert.NoError(t, err, "Syncer status should report Synced=False after a failed sync")
+}
