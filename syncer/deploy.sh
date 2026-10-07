@@ -34,6 +34,10 @@
 #   4. Deploy the KRMSyncer CRD, RBAC and controller to the destination cluster.
 #   5. Deploy the KRMSyncer configuration (config/templates/krmsyncer.yaml),
 #      which references the source cluster in spec.remote.gkeCluster.
+#      --sync-mode=status (default) syncs only status, plus spec.resourceID for
+#      the GVKs listed in
+#      config/templates/service-generated-resource-id-gvks.yaml;
+#      --sync-mode=full syncs spec and status of all KCC resources.
 #
 # Each destination cluster gets its own GSA, krmsyncer-<cluster>-<hash> (see
 # gsa_name in lib.sh), so grants to one destination cluster don't leak to
@@ -92,6 +96,10 @@ Flags:
       --project          GCP project of the destination cluster and the controller's
                          Google Service Account (required)
   -n, --namespace        Namespace for the KRMSyncer CR (default: ${CONTROLLER_NAMESPACE})
+      --sync-mode        What the KRMSyncer CR replicates from KCC resources (default: status):
+                         status: only status, plus spec.resourceID for the GVKs in
+                                 config/templates/service-generated-resource-id-gvks.yaml
+                         full:   spec and status
   -i, --image            Controller image (default:
                          <image-location>-docker.pkg.dev/<project>/${IMAGE_REPOSITORY}/controller:latest)
       --image-location   Artifact Registry location of the default image: a region
@@ -118,6 +126,7 @@ DEST_LOCATION=""
 DEST_CONTEXT=""
 PROJECT=""
 NAMESPACE="${CONTROLLER_NAMESPACE}"
+SYNC_MODE="status"
 IMAGE=""
 IMAGE_LOCATION=""
 SKIP_BUILD="false"
@@ -125,6 +134,7 @@ SKIP_BUILD="false"
 # Set by the preflight checks.
 GSA_EXISTS="false"
 MANIFESTS=""
+SYNC_CONFIG=""
 GO_VERSION=""
 
 parse_flags() {
@@ -155,6 +165,7 @@ parse_flags() {
       --dest-context)    DEST_CONTEXT="$2" ;;
       --project)         PROJECT="$2" ;;
       -n|--namespace)    NAMESPACE="$2" ;;
+      --sync-mode)       SYNC_MODE="$2" ;;
       -i|--image)        IMAGE="$2" ;;
       --image-location)  IMAGE_LOCATION="$2" ;;
       *) usage >&2; die "unknown flag: ${flag}" ;;
@@ -176,6 +187,11 @@ parse_flags() {
   case "${SOURCE_ENDPOINT}" in
     Default|DNS|PrivateIP) ;;
     *) die "--source-endpoint must be Default, DNS or PrivateIP (got \"${SOURCE_ENDPOINT}\")" ;;
+  esac
+
+  case "${SYNC_MODE}" in
+    status|full) ;;
+    *) die "--sync-mode must be status or full (got \"${SYNC_MODE}\")" ;;
   esac
 }
 
@@ -219,6 +235,7 @@ print_summary() {
   log_info "Dest Cluster Context   : ${DEST_CONTEXT}"
   log_info "GCP Project            : ${PROJECT}"
   log_info "Syncer CR Namespace    : ${NAMESPACE}"
+  log_info "Sync Mode              : ${SYNC_MODE}"
   log_info "Controller Namespace   : ${CONTROLLER_NAMESPACE}"
   log_info "Controller Image       : ${IMAGE}"
   log_info "Google Service Account : ${GSA_EMAIL}"
@@ -238,6 +255,76 @@ render_template() {
     content="${content//"\${${kv%%=*}}"/"${kv#*=}"}"
   done
   printf '%s\n' "${content}"
+}
+
+# print_resource_id_rule prints a KRMSyncer rule that syncs status and
+# spec.resourceID for one GVK. Usage: print_resource_id_rule <file> <group> <version> <kind>
+print_resource_id_rule() {
+  [[ -n "$2" && -n "$3" && -n "$4" ]] ||
+    die "$1: incomplete entry (group: \"$2\", version: \"$3\", kind: \"$4\")"
+  printf '  - group: %s\n    version: %s\n    kind: %s\n    syncFields: [status, spec.resourceID]\n' "$2" "$3" "$4"
+}
+
+# resource_id_rules prints a [status, spec.resourceID] KRMSyncer rule for each
+# GVK in the list at $1 (service-generated-resource-id-gvks.yaml). The file is
+# a YAML list of {group, version, kind} maps with unquoted values, one key per
+# line; anything else is rejected rather than silently skipped.
+resource_id_rules() {
+  local file="$1" line count=0 group="" version="" kind=""
+  local re='^(- |  )(group|version|kind):[[:space:]]*([^[:space:]\"'\'']+)[[:space:]]*$'
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    line="${line%%#*}"
+    [[ -n "${line//[[:space:]]/}" ]] || continue
+    [[ "${line}" =~ ${re} ]] || die "${file}: unexpected line: ${line}"
+    if [[ "${BASH_REMATCH[1]}" == "- " ]]; then
+      [[ ${count} -eq 0 ]] || print_resource_id_rule "${file}" "${group}" "${version}" "${kind}"
+      count=$((count + 1))
+      group="" version="" kind=""
+    elif [[ ${count} -eq 0 ]]; then
+      die "${file}: unexpected line before the first entry: ${line}"
+    fi
+    case "${BASH_REMATCH[2]}" in
+      group)   group="${BASH_REMATCH[3]}" ;;
+      version) version="${BASH_REMATCH[3]}" ;;
+      kind)    kind="${BASH_REMATCH[3]}" ;;
+    esac
+  done <"${file}"
+  [[ ${count} -gt 0 ]] || die "${file}: no GVKs found"
+  print_resource_id_rule "${file}" "${group}" "${version}" "${kind}"
+}
+
+# render_sync_config renders the KRMSyncer CR for --sync-mode into
+# SYNC_CONFIG. In status mode, the resource ID rules are appended after the
+# wildcard status-only rule, which must stay first (see
+# config/templates/krmsyncer.yaml). It sets a global instead of printing, so
+# errors in the command substitutions below abort the script (errexit is not
+# inherited by nested command substitutions).
+render_sync_config() {
+  local template="${TEMPLATES_DIR}/krmsyncer.yaml"
+  local gvks="${TEMPLATES_DIR}/service-generated-resource-id-gvks.yaml"
+  local sync_fields="[spec, status]"
+  [[ "${SYNC_MODE}" == "full" ]] || sync_fields="[status]"
+  [[ -f "${template}" ]] || die "${template} not found"
+
+  local config rules=""
+  config="$(render_template "${template}" \
+    "SYNC_CONFIG_NAME=${SYNC_CONFIG_NAME}" \
+    "NAMESPACE=${NAMESPACE}" \
+    "SOURCE_PROJECT=${SOURCE_PROJECT}" \
+    "SOURCE_LOCATION=${SOURCE_LOCATION}" \
+    "SOURCE_CLUSTER=${SOURCE_CLUSTER}" \
+    "SOURCE_ENDPOINT=${SOURCE_ENDPOINT}" \
+    "SYNC_FIELDS=${sync_fields}")"
+  # The appended rules extend spec.rules, so it must end the template.
+  [[ "${config}" == *$'\n'"    syncFields: ${sync_fields}" ]] ||
+    die "${template} must end with the wildcard rule's syncFields (spec.rules must be the last field)"
+  if [[ "${SYNC_MODE}" == "status" ]]; then
+    [[ -f "${gvks}" ]] || die "${gvks} not found"
+    rules="$(resource_id_rules "${gvks}")"
+  fi
+  SYNC_CONFIG="${config}"
+  [[ -z "${rules}" ]] || SYNC_CONFIG+=$'\n'"${rules}"
 }
 
 # ensure_image_repository creates the Artifact Registry Docker repository for
@@ -466,14 +553,15 @@ check_dest_cluster() {
   done
 }
 
-# render_manifests renders the controller manifests into MANIFESTS.
+# render_manifests renders the controller manifests into MANIFESTS and the
+# KRMSyncer CR into SYNC_CONFIG.
 render_manifests() {
   local config_dir="${MODULE_DIR}/config/default"
   log_info "Rendering manifests from ${config_dir}..."
   MANIFESTS="$(kubectl kustomize "${config_dir}")"
   [[ "${MANIFESTS}" == *"image: ${IMAGE_PLACEHOLDER}"* ]] ||
     die "image \"${IMAGE_PLACEHOLDER}\" not found in rendered manifests; check config/manager/manager.yaml"
-  [[ -f "${TEMPLATES_DIR}/krmsyncer.yaml" ]] || die "${TEMPLATES_DIR}/krmsyncer.yaml not found"
+  render_sync_config
 }
 
 # check_build sets GO_VERSION and checks that Docker can build the image.
@@ -556,15 +644,9 @@ deploy_controller() {
 }
 
 deploy_sync_config() {
-  log_info "Applying KRMSyncer ${NAMESPACE}/${SYNC_CONFIG_NAME}..."
+  log_info "Applying KRMSyncer ${NAMESPACE}/${SYNC_CONFIG_NAME} (--sync-mode=${SYNC_MODE})..."
   kube_dest create namespace "${NAMESPACE}" --dry-run=client -o yaml | kube_dest apply -f - >/dev/null
-  render_template "${TEMPLATES_DIR}/krmsyncer.yaml" \
-    "SYNC_CONFIG_NAME=${SYNC_CONFIG_NAME}" \
-    "NAMESPACE=${NAMESPACE}" \
-    "SOURCE_PROJECT=${SOURCE_PROJECT}" \
-    "SOURCE_LOCATION=${SOURCE_LOCATION}" \
-    "SOURCE_CLUSTER=${SOURCE_CLUSTER}" \
-    "SOURCE_ENDPOINT=${SOURCE_ENDPOINT}" | kube_dest apply -f -
+  printf '%s\n' "${SYNC_CONFIG}" | kube_dest apply -f -
   log_success "KRMSyncer configuration applied."
 }
 
