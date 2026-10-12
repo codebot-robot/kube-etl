@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# krmsyncer.sh installs KRMSyncer into the destination GKE cluster and
+# deploy.sh installs KRMSyncer into the destination GKE cluster and
 # configures it to pull resources from the source GKE cluster:
 #
 #   1. Configure Workload Identity: a Google Service Account (GSA) for the

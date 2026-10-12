@@ -65,7 +65,7 @@ make test-integration
 
 ### Prerequisites
 
-Before running [`krmsyncer.sh`](krmsyncer.sh), make sure you have the following.
+Before running [`deploy.sh`](deploy.sh), make sure you have the following.
 
 **Local tools**
 
@@ -155,12 +155,12 @@ kubectl --context=<DEST_CONTEXT> run nettest --rm -i --restart=Never --image=bus
 
 ### 1. Deploy KRMSyncer to the Destination Cluster
 
-Use the [`krmsyncer.sh`](krmsyncer.sh) script.
+Use the [`deploy.sh`](deploy.sh) script.
 
 ```bash
 cd syncer
 
-./krmsyncer.sh \
+./deploy.sh \
   --source-cluster <SOURCE_CLUSTER_NAME> \
   --source-location <SOURCE_CLUSTER_LOCATION> \
   --dest-cluster <DEST_CLUSTER_NAME> \
