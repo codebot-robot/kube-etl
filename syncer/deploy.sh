@@ -26,6 +26,10 @@
 #   5. Deploy the KRMSyncer configuration (config/templates/krmsyncer.yaml),
 #      which references the source cluster in spec.remote.gkeCluster.
 #
+# Each destination cluster gets its own GSA, krmsyncer-<cluster>-<hash> (see
+# gsa_name in lib.sh), so grants to one destination cluster don't leak to
+# others.
+#
 # No credentials are stored in either cluster and nothing is created on the
 # source cluster. The controller looks up the source cluster's endpoint and CA
 # through the GKE API and authenticates as the GSA. roles/container.viewer
@@ -45,18 +49,13 @@ set -o pipefail
 MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATES_DIR="${MODULE_DIR}/config/templates"
 
-CONTROLLER_NAMESPACE="krmsyncer-system"
-CONTROLLER_DEPLOYMENT="krmsyncer-controller-manager"
-KRMSYNCER_CRD="krmsyncers.syncer.gkelabs.io"
+# shellcheck source=lib.sh
+source "${MODULE_DIR}/lib.sh"
+
 IMAGE_PLACEHOLDER="controller:latest"
 
 # KRMSyncer CR rendered from config/templates/krmsyncer.yaml.
 SYNC_CONFIG_NAME="kcc-resource-syncer"
-
-# Kubernetes ServiceAccount of the controller (config/rbac/service_account.yaml),
-# and the Google Service Account it impersonates via Workload Identity.
-CONTROLLER_KSA="krmsyncer-controller-manager"
-GSA_NAME="krmsyncer"
 
 # --- Logging -----------------------------------------------------------------
 
@@ -179,6 +178,8 @@ complete() {
 
   [[ -n "${IMAGE}" ]] || IMAGE="gcr.io/${PROJECT}/krmsyncer/controller:latest"
 
+  DEST_ID="${PROJECT}/${DEST_LOCATION}/${DEST_CLUSTER}"
+  GSA_NAME="$(gsa_name "${DEST_LOCATION}" "${DEST_CLUSTER}")"
   GSA_EMAIL="${GSA_NAME}@${PROJECT}.iam.gserviceaccount.com"
   WI_MEMBER="serviceAccount:${PROJECT}.svc.id.goog[${CONTROLLER_NAMESPACE}/${CONTROLLER_KSA}]"
 }
@@ -237,12 +238,17 @@ configure_workload_identity() {
 (existing node pools also need --workload-metadata=GKE_METADATA)"
   log_success "Workload Identity enabled (pool: ${pool})."
 
-  if gcloud iam service-accounts describe "${GSA_EMAIL}" --project "${PROJECT}" >/dev/null 2>&1; then
+  local description
+  if description="$(gcloud iam service-accounts describe "${GSA_EMAIL}" --project "${PROJECT}" \
+      --format='value(description)' 2>/dev/null)"; then
+    [[ "${description}" == "$(gsa_description "${DEST_ID}")" ]] ||
+      die "${GSA_EMAIL} exists but was not created by this script for ${DEST_ID} (description: \"${description}\")"
     log_info "Google Service Account ${GSA_EMAIL} already exists."
   else
     log_info "Creating Google Service Account ${GSA_EMAIL}..."
     gcloud iam service-accounts create "${GSA_NAME}" --project "${PROJECT}" \
-      --display-name "KRMSyncer controller"
+      --display-name "KRMSyncer controller (${DEST_CLUSTER})" \
+      --description "$(gsa_description "${DEST_ID}")"
   fi
 
   # roles/container.viewer includes container.clusters.get (look up the source
@@ -399,6 +405,8 @@ main() {
   log_info "If the logs show the source cluster can't be reached right after setup (e.g. new IAM"
   log_info "bindings still propagating), restart the controller once they take effect:"
   log_info "  kubectl --context=${DEST_CONTEXT} -n ${CONTROLLER_NAMESPACE} rollout restart deploy/${CONTROLLER_DEPLOYMENT}"
+  log_info "If ${GSA_EMAIL} was granted access to a previous source project, revoke it with:"
+  log_info "  ${MODULE_DIR}/cleanup.sh --dest-cluster ${DEST_CLUSTER} --dest-location ${DEST_LOCATION} --project ${PROJECT} --source-project <OLD_SOURCE_PROJECT>"
 }
 
 main "$@"

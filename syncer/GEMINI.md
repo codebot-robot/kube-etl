@@ -19,6 +19,8 @@ This project is a standard Kubernetes controller built using `controller-runtime
 *   `config/`: Kustomize configuration for deploying the controller and CRDs.
     *   `config/templates/`: YAML templates (sample `KRMSyncer` CR), filled in by `deploy.sh`.
 *   `deploy.sh`: Deploys the controller to a destination GKE cluster and configures it to pull from a source GKE cluster.
+*   `lib.sh`: Names and helpers shared by `deploy.sh` and `cleanup.sh` (e.g. the per-destination GSA name).
+*   `cleanup.sh`: Revokes the IAM grants `deploy.sh` gave the destination cluster's GSA on source projects that are no longer in use.
 *   `main.go`: The entry point for the controller manager.
 
 ## Key Components

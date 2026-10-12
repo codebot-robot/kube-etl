@@ -184,16 +184,51 @@ cd syncer
 `--skip-build` deploys the image as is, without building and pushing it.
 
 This command:
-1. Configures Workload Identity. It creates the `krmsyncer@<project>.iam.gserviceaccount.com` Google Service Account (GSA), grants it `roles/container.viewer` on the source cluster's project, and lets the controller's `krmsyncer-system/krmsyncer-controller-manager` Kubernetes ServiceAccount impersonate it. `roles/container.viewer` lets the GSA look up the source cluster, connect to it (including over the DNS endpoint) and read its Kubernetes objects.
+1. Configures Workload Identity. It creates a Google Service Account (GSA) for the destination cluster, `krmsyncer-<dest-cluster>-<hash>@<project>.iam.gserviceaccount.com` (up to 12 characters of the cluster name plus a hash of its location and name, to stay within the 30-character limit on GSA names). It grants the GSA `roles/container.viewer` on the source cluster's project, and lets the controller's `krmsyncer-system/krmsyncer-controller-manager` Kubernetes ServiceAccount impersonate it. `roles/container.viewer` lets the GSA look up the source cluster, connect to it (including over the DNS endpoint) and read its Kubernetes objects.
 2. Builds and pushes the controller image (unless `--skip-build` is set).
 3. Checks that the source cluster exists and exposes the selected endpoint.
 4. Deploys the RBAC, KRMSyncer CRD and controller into the `krmsyncer-system` namespace of the destination cluster, and annotates the controller's ServiceAccount with the GSA.
 5. Applies the `kcc-resource-syncer` `KRMSyncer` CR from [`config/templates/krmsyncer.yaml`](config/templates/krmsyncer.yaml). It references the source cluster in `spec.remote.gkeCluster` and syncs all Config Connector resources from it. The destination cluster needs the matching KCC CRDs pre-installed.
 
+The script only adds IAM bindings. If you re-run it with a different `--source-project`, the GSA keeps its access to the previous source project until you revoke it with [`cleanup.sh`](cleanup.sh) (see [Cleaning up IAM bindings](#cleaning-up-iam-bindings)).
+
 View the controller logs with:
 ```bash
 kubectl --context=gke_<project>_<dest-location>_<dest-cluster> -n krmsyncer-system logs deploy/krmsyncer-controller-manager -f
 ```
+
+### Cleaning up IAM bindings
+
+`deploy.sh` grants the destination cluster's GSA `roles/container.viewer` on the source project, but never removes grants. After `deploy.sh` has switched a destination cluster to a different `--source-project`, revoke the old grant with [`cleanup.sh`](cleanup.sh):
+
+```bash
+cd syncer
+
+./cleanup.sh \
+  --dest-cluster <DEST_CLUSTER_NAME> \
+  --dest-location <DEST_CLUSTER_LOCATION> \
+  --project <GCP_PROJECT_ID> \
+  --source-project <OLD_SOURCE_PROJECT_ID> \
+  [--dry-run]
+```
+
+`--source-project` names a previous source project to revoke (required). Repeat it for several projects.
+
+`--dest-context` sets the kubectl context of the destination cluster.
+
+`--dry-run` prints the grants that would be revoked without changing anything.
+
+The script only revokes what is safe to revoke:
+
+- It removes only the GSA's own unconditional `roles/container.viewer` binding. Other members of the role keep their access.
+- It never revokes a project that a `KRMSyncer` CR in the destination cluster still references in `spec.remote.gkeCluster.project`, in any namespace.
+- It refuses a GSA that `deploy.sh` did not create for this destination cluster (checked through the GSA's description), since other clusters may depend on its grants.
+
+To remove KRMSyncer from a destination cluster entirely, delete the `KRMSyncer` CRs first. Then run `cleanup.sh` with the remaining source project and delete the GSA:
+```bash
+gcloud iam service-accounts delete <GSA_EMAIL> --project <GCP_PROJECT_ID>
+```
+Revoke the project grants **before** deleting the GSA. A deleted GSA has no access, but its bindings stay in the policies as `deleted:serviceAccount:...` members until IAM purges them.
 
 ### 2. Verify the Results
 1. Create a test resource in the Source cluster:
