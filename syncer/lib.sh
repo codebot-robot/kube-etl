@@ -56,3 +56,39 @@ gsa_name() {
 gsa_description() {
   printf 'KRMSyncer controller for destination cluster %s\n' "$1"
 }
+
+# resolve_dest_context sets DEST_CONTEXT to the kubectl context of the
+# destination cluster and checks that it exists. If DEST_CONTEXT is empty, it
+# defaults to the name `gcloud container clusters get-credentials` creates,
+# gke_<project>_<location>_<cluster>. A context set with --dest-context is
+# also checked, on a best-effort basis, against the cluster's endpoints, and a
+# mismatch is reported as a warning: Connect Gateway or proxied contexts point
+# elsewhere legitimately.
+resolve_dest_context() {
+  local get_credentials="gcloud container clusters get-credentials ${DEST_CLUSTER} --location ${DEST_LOCATION} --project ${PROJECT}"
+  if [[ -z "${DEST_CONTEXT}" ]]; then
+    DEST_CONTEXT="gke_${PROJECT}_${DEST_LOCATION}_${DEST_CLUSTER}"
+    kubectl config get-contexts "${DEST_CONTEXT}" >/dev/null 2>&1 ||
+      die "kubectl context \"${DEST_CONTEXT}\" not found; run: ${get_credentials}
+(or pass --dest-context if you renamed the context)"
+    return
+  fi
+
+  kubectl config get-contexts "${DEST_CONTEXT}" >/dev/null 2>&1 ||
+    die "kubectl context \"${DEST_CONTEXT}\" (--dest-context) not found in your kubeconfig"
+
+  local server host endpoints
+  server="$(kubectl config view --minify --context "${DEST_CONTEXT}" \
+    -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)" || server=""
+  host="${server#*://}"
+  host="${host%%/*}"
+  host="${host%:*}"
+  endpoints="$(gcloud container clusters describe "${DEST_CLUSTER}" \
+    --location "${DEST_LOCATION}" --project "${PROJECT}" \
+    --format='csv[no-heading](endpoint,privateClusterConfig.privateEndpoint,controlPlaneEndpointsConfig.ipEndpointsConfig.privateEndpoint,controlPlaneEndpointsConfig.dnsEndpointConfig.endpoint)' \
+    2>/dev/null)" || endpoints=""
+  if [[ -z "${host}" || ",${endpoints}," != *",${host},"* ]]; then
+    log_warn "kubectl context \"${DEST_CONTEXT}\" points at ${server:-an unknown server}, which is not an endpoint of"
+    log_warn "${PROJECT}/${DEST_LOCATION}/${DEST_CLUSTER}. Make sure it is the destination cluster."
+  fi
+}

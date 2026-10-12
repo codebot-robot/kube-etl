@@ -58,12 +58,14 @@ Usage: $(basename "$0") --dest-cluster <NAME> --dest-location <LOCATION> --proje
 Revokes roles/container.viewer on source projects that the destination
 cluster's KRMSyncer GSA was granted by deploy.sh but no longer syncs from.
 Projects referenced by a KRMSyncer CR in the destination cluster are never
-revoked. The destination cluster needs a kubectl context created by
-\`gcloud container clusters get-credentials\`.
+revoked. The destination cluster needs a kubectl context (by default the one
+created by \`gcloud container clusters get-credentials\`).
 
 Flags:
       --dest-cluster     Name of the destination GKE cluster (required)
       --dest-location    Location (region or zone) of the destination cluster (required)
+      --dest-context     kubectl context of the destination cluster
+                         (default: gke_<project>_<dest-location>_<dest-cluster>)
       --project          GCP project of the destination cluster and the GSA (required)
       --source-project   Previous source project to revoke (required; repeatable)
       --dry-run          Print what would be revoked, without changing anything
@@ -79,6 +81,7 @@ EOF
 
 DEST_CLUSTER=""
 DEST_LOCATION=""
+DEST_CONTEXT=""
 PROJECT=""
 CANDIDATES=()
 DRY_RUN="false"
@@ -99,6 +102,7 @@ parse_flags() {
     case "${flag}" in
       --dest-cluster)   DEST_CLUSTER="$2" ;;
       --dest-location)  DEST_LOCATION="$2" ;;
+      --dest-context)   DEST_CONTEXT="$2" ;;
       --project)        PROJECT="$2" ;;
       --source-project) CANDIDATES+=("$2") ;;
       *) usage >&2; die "unknown flag: ${flag}" ;;
@@ -126,10 +130,7 @@ check_deps() {
 
 complete() {
   DEST_ID="${PROJECT}/${DEST_LOCATION}/${DEST_CLUSTER}"
-  # Context name created by `gcloud container clusters get-credentials`.
-  DEST_CONTEXT="gke_${PROJECT}_${DEST_LOCATION}_${DEST_CLUSTER}"
-  kubectl config get-contexts "${DEST_CONTEXT}" >/dev/null 2>&1 ||
-    die "kubectl context \"${DEST_CONTEXT}\" not found; run: gcloud container clusters get-credentials ${DEST_CLUSTER} --location ${DEST_LOCATION} --project ${PROJECT}"
+  resolve_dest_context
   kube_dest get --raw /version >/dev/null ||
     die "cannot reach destination cluster with context \"${DEST_CONTEXT}\""
 }

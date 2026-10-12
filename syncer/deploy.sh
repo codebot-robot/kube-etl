@@ -38,7 +38,7 @@
 #
 # The script deploys to the destination cluster through the kubectl context
 # created by `gcloud container clusters get-credentials`
-# (gke_<project>_<location>_<cluster>).
+# (gke_<project>_<location>_<cluster>), or the one set with --dest-context.
 
 set -o errexit
 set -o nounset
@@ -60,6 +60,7 @@ SYNC_CONFIG_NAME="kcc-resource-syncer"
 # --- Logging -----------------------------------------------------------------
 
 log_info()    { echo -e "\033[0;34m[INFO]\033[0m $*"; }
+log_warn()    { echo -e "\033[0;33m[WARN]\033[0m $*" >&2; }
 log_success() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 log_header()  { echo -e "\n\033[1;36m=== $* ===\033[0m"; }
 die()         { echo -e "\033[0;31m[ERROR]\033[0m $*" >&2; exit 1; }
@@ -71,8 +72,8 @@ Usage: $(basename "$0") --source-cluster <NAME> --source-location <LOCATION> \\
 
 Deploys KRMSyncer to the destination GKE cluster and configures it to pull
 resources from the source GKE cluster. The destination cluster needs a kubectl
-context created by \`gcloud container clusters get-credentials\` and Workload
-Identity enabled.
+context (by default the one created by \`gcloud container clusters get-credentials\`)
+and Workload Identity enabled.
 
 Flags:
       --source-cluster   Name of the source GKE cluster (required)
@@ -82,6 +83,8 @@ Flags:
                          Default, DNS or PrivateIP (default: Default)
       --dest-cluster     Name of the destination GKE cluster (required)
       --dest-location    Location (region or zone) of the destination cluster (required)
+      --dest-context     kubectl context of the destination cluster
+                         (default: gke_<project>_<dest-location>_<dest-cluster>)
       --project          GCP project of the destination cluster and the controller's
                          Google Service Account (required)
   -n, --namespace        Namespace for the KRMSyncer CR (default: ${CONTROLLER_NAMESPACE})
@@ -104,6 +107,7 @@ SOURCE_PROJECT=""
 SOURCE_ENDPOINT="Default"
 DEST_CLUSTER=""
 DEST_LOCATION=""
+DEST_CONTEXT=""
 PROJECT=""
 NAMESPACE="${CONTROLLER_NAMESPACE}"
 IMAGE=""
@@ -129,6 +133,7 @@ parse_flags() {
       --source-endpoint) SOURCE_ENDPOINT="$2" ;;
       --dest-cluster)    DEST_CLUSTER="$2" ;;
       --dest-location)   DEST_LOCATION="$2" ;;
+      --dest-context)    DEST_CONTEXT="$2" ;;
       --project)         PROJECT="$2" ;;
       -n|--namespace)    NAMESPACE="$2" ;;
       -i|--image)        IMAGE="$2" ;;
@@ -171,10 +176,7 @@ complete() {
   [[ "${SOURCE_PROJECT}/${SOURCE_LOCATION}/${SOURCE_CLUSTER}" != "${PROJECT}/${DEST_LOCATION}/${DEST_CLUSTER}" ]] ||
     die "source and destination are the same cluster (${PROJECT}/${DEST_LOCATION}/${DEST_CLUSTER})"
 
-  # Context name created by `gcloud container clusters get-credentials`.
-  DEST_CONTEXT="gke_${PROJECT}_${DEST_LOCATION}_${DEST_CLUSTER}"
-  kubectl config get-contexts "${DEST_CONTEXT}" >/dev/null 2>&1 ||
-    die "kubectl context \"${DEST_CONTEXT}\" not found; run: gcloud container clusters get-credentials ${DEST_CLUSTER} --location ${DEST_LOCATION} --project ${PROJECT}"
+  resolve_dest_context
 
   [[ -n "${IMAGE}" ]] || IMAGE="gcr.io/${PROJECT}/krmsyncer/controller:latest"
 
@@ -406,7 +408,7 @@ main() {
   log_info "bindings still propagating), restart the controller once they take effect:"
   log_info "  kubectl --context=${DEST_CONTEXT} -n ${CONTROLLER_NAMESPACE} rollout restart deploy/${CONTROLLER_DEPLOYMENT}"
   log_info "If ${GSA_EMAIL} was granted access to a previous source project, revoke it with:"
-  log_info "  ${MODULE_DIR}/cleanup.sh --dest-cluster ${DEST_CLUSTER} --dest-location ${DEST_LOCATION} --project ${PROJECT} --source-project <OLD_SOURCE_PROJECT>"
+  log_info "  ${MODULE_DIR}/cleanup.sh --dest-cluster ${DEST_CLUSTER} --dest-location ${DEST_LOCATION} --project ${PROJECT} --dest-context ${DEST_CONTEXT} --source-project <OLD_SOURCE_PROJECT>"
 }
 
 main "$@"

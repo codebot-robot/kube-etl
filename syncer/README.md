@@ -78,7 +78,7 @@ Before running [`deploy.sh`](deploy.sh), make sure you have the following.
 - The destination cluster must have [Workload Identity](https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity) enabled.
 - You need permission to create service accounts and grant IAM roles in the project.
 - You need permission to grant IAM roles in the source cluster's project, and to describe the source cluster.
-- You need a kubeconfig context for the destination cluster, with permission to deploy on it. Create it with:
+- You need a kubeconfig context for the destination cluster, with permission to deploy on it. Create it with the following command, or pass an existing context with `--dest-context`:
   ```bash
   gcloud container clusters get-credentials <DEST_CLUSTER_NAME> --location <DEST_CLUSTER_LOCATION> --project <GCP_PROJECT_ID>
   ```
@@ -166,6 +166,7 @@ cd syncer
   --dest-cluster <DEST_CLUSTER_NAME> \
   --dest-location <DEST_CLUSTER_LOCATION> \
   --project <GCP_PROJECT_ID> \
+  [--dest-context <DEST_CONTEXT>] \
   [--source-project <SOURCE_PROJECT_ID>] \
   [--source-endpoint Default|DNS|PrivateIP] \
   [-n <NAMESPACE>] \
@@ -174,6 +175,8 @@ cd syncer
 ```
 
 `--source-project` sets the source cluster's project (default: `--project`).
+
+`--dest-context` sets the kubectl context of the destination cluster. It defaults to `gke_<project>_<dest-location>_<dest-cluster>`, the name `gcloud container clusters get-credentials` creates; set it if you renamed the context. The script warns if the context's server is not one of the destination cluster's endpoints.
 
 `--source-endpoint` selects the source cluster's control plane endpoint: `Default`, `DNS` or `PrivateIP` (default: `Default`).
 
@@ -194,7 +197,7 @@ The script only adds IAM bindings. If you re-run it with a different `--source-p
 
 View the controller logs with:
 ```bash
-kubectl --context=gke_<project>_<dest-location>_<dest-cluster> -n krmsyncer-system logs deploy/krmsyncer-controller-manager -f
+kubectl --context=<DEST_CONTEXT> -n krmsyncer-system logs deploy/krmsyncer-controller-manager -f
 ```
 
 ### Cleaning up IAM bindings
@@ -208,6 +211,7 @@ cd syncer
   --dest-cluster <DEST_CLUSTER_NAME> \
   --dest-location <DEST_CLUSTER_LOCATION> \
   --project <GCP_PROJECT_ID> \
+  [--dest-context <DEST_CONTEXT>] \
   --source-project <OLD_SOURCE_PROJECT_ID> \
   [--dry-run]
 ```
