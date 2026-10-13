@@ -464,7 +464,7 @@ check_source_cluster() {
       print_reachability_hint "${private_ip}"
       ;;
     DNS)
-      [[ -n "${dns_endpoint}" && "${dns_external,,}" == "true" ]] ||
+      [[ -n "${dns_endpoint}" && "${dns_external}" == [Tt]rue ]] ||
         die "source cluster's DNS endpoint is not enabled for external traffic; enable it with:
   ${update} --enable-dns-access
 or use --source-endpoint Default or PrivateIP"

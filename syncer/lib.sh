@@ -52,7 +52,7 @@ gsa_name() {
   local location="$1" cluster="$2" hash prefix
   hash="$(printf '%s' "${location}/${cluster}" | sha256_hex)"
   hash="${hash:0:6}"
-  prefix="${cluster,,}"
+  prefix="$(printf '%s' "${cluster}" | tr 'A-Z' 'a-z')"
   prefix="${prefix//[^a-z0-9-]/-}"
   prefix="${prefix:0:12}"
   while [[ "${prefix}" == *- ]]; do prefix="${prefix%-}"; done
