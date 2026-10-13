@@ -235,11 +235,17 @@ render_template() {
 # the user.
 ensure_image_repository() {
   [[ "${IMAGE}" == "${DEFAULT_IMAGE_REPO}/"* ]] || return 0
-  if gcloud artifacts repositories describe "${IMAGE_REPOSITORY}" \
-      --location "${IMAGE_REGION}" --project "${PROJECT}" >/dev/null 2>&1; then
-    log_info "Artifact Registry repository ${DEFAULT_IMAGE_REPO} already exists."
-    return
-  fi
+  local rc=0
+  gcloud_describe gcloud artifacts repositories describe "${IMAGE_REPOSITORY}" \
+    --location "${IMAGE_REGION}" --project "${PROJECT}" >/dev/null || rc=$?
+  case "${rc}" in
+    0)
+      log_info "Artifact Registry repository ${DEFAULT_IMAGE_REPO} already exists."
+      return
+      ;;
+    1) ;;
+    *) die "cannot describe Artifact Registry repository ${DEFAULT_IMAGE_REPO} (is the Artifact Registry API enabled? gcloud services enable artifactregistry.googleapis.com --project ${PROJECT})" ;;
+  esac
   log_info "Creating Artifact Registry repository ${DEFAULT_IMAGE_REPO}..."
   gcloud artifacts repositories create "${IMAGE_REPOSITORY}" \
     --repository-format docker --location "${IMAGE_REGION}" --project "${PROJECT}" \
@@ -312,6 +318,45 @@ quiet() {
   fi
 }
 
+# gcloud_describe runs a gcloud describe command and prints its stdout. It
+# returns 1 if the resource doesn't exist (NOT_FOUND), and prints the error and
+# returns 2 on any other failure, so permission, auth or network errors aren't
+# mistaken for a missing resource.
+gcloud_describe() {
+  local out err err_file rc=0
+  err_file="$(mktemp)"
+  out="$("$@" 2>"${err_file}")" || rc=$?
+  err="$(<"${err_file}")"
+  rm -f "${err_file}"
+  if [[ ${rc} -eq 0 ]]; then
+    printf '%s\n' "${out}"
+    return 0
+  fi
+  [[ "${err}" != *NOT_FOUND* ]] || return 1
+  printf '%s\n' "${err}" >&2
+  return 2
+}
+
+# retry_gsa_not_found runs a command, retrying for up to a minute while it fails
+# because a Google Service Account doesn't exist yet. GSA creation is eventually
+# consistent, so IAM calls right after `gcloud iam service-accounts create` can
+# fail with "does not exist". Output is printed only if the command fails.
+retry_gsa_not_found() {
+  local attempt out
+  for attempt in 1 2 3 4 5 6 7; do
+    out="$("$@" 2>&1)" && return 0
+    case "${out}" in
+      *"does not exist"*|*NOT_FOUND*) ;;
+      *) break ;;
+    esac
+    [[ ${attempt} -lt 7 ]] || break
+    log_info "  Service account not visible yet; retrying in 10s..."
+    sleep 10
+  done
+  printf '%s\n' "${out}" >&2
+  return 1
+}
+
 # --- Steps -------------------------------------------------------------------
 
 configure_workload_identity() {
@@ -325,30 +370,35 @@ configure_workload_identity() {
 (existing node pools also need --workload-metadata=GKE_METADATA)"
   log_success "Workload Identity enabled (pool: ${pool})."
 
-  local description
-  if description="$(gcloud iam service-accounts describe "${GSA_EMAIL}" --project "${PROJECT}" \
-      --format='value(description)' 2>/dev/null)"; then
-    [[ "${description}" == "$(gsa_description "${DEST_ID}")" ]] ||
-      die "${GSA_EMAIL} exists but was not created by this script for ${DEST_ID} (description: \"${description}\")"
-    log_info "Google Service Account ${GSA_EMAIL} already exists."
-  else
-    log_info "Creating Google Service Account ${GSA_EMAIL}..."
-    gcloud iam service-accounts create "${GSA_NAME}" --project "${PROJECT}" \
-      --display-name "KRMSyncer controller (${DEST_CLUSTER})" \
-      --description "$(gsa_description "${DEST_ID}")"
-  fi
+  local description rc=0
+  description="$(gcloud_describe gcloud iam service-accounts describe "${GSA_EMAIL}" \
+    --project "${PROJECT}" --format='value(description)')" || rc=$?
+  case "${rc}" in
+    0)
+      [[ "${description}" == "$(gsa_description "${DEST_ID}")" ]] ||
+        die "${GSA_EMAIL} exists but was not created by this script for ${DEST_ID} (description: \"${description}\")"
+      log_info "Google Service Account ${GSA_EMAIL} already exists."
+      ;;
+    1)
+      log_info "Creating Google Service Account ${GSA_EMAIL}..."
+      gcloud iam service-accounts create "${GSA_NAME}" --project "${PROJECT}" \
+        --display-name "KRMSyncer controller (${DEST_CLUSTER})" \
+        --description "$(gsa_description "${DEST_ID}")"
+      ;;
+    *) die "cannot describe Google Service Account ${GSA_EMAIL}" ;;
+  esac
 
   # roles/container.viewer includes container.clusters.get (look up the source
   # cluster's endpoint and CA, and authenticate to it), container.clusters.connect
   # (needed for the DNS endpoint) and read access to Kubernetes objects in the
   # project's clusters, so no RBAC objects are needed on the source cluster.
   log_info "Granting roles/container.viewer on project ${SOURCE_PROJECT} to ${GSA_EMAIL}..."
-  quiet gcloud projects add-iam-policy-binding "${SOURCE_PROJECT}" \
+  retry_gsa_not_found gcloud projects add-iam-policy-binding "${SOURCE_PROJECT}" \
     --member "serviceAccount:${GSA_EMAIL}" --role roles/container.viewer \
     --condition=None --quiet
 
   log_info "Allowing ${WI_MEMBER} to impersonate ${GSA_EMAIL}..."
-  quiet gcloud iam service-accounts add-iam-policy-binding "${GSA_EMAIL}" --project "${PROJECT}" \
+  retry_gsa_not_found gcloud iam service-accounts add-iam-policy-binding "${GSA_EMAIL}" --project "${PROJECT}" \
     --member "${WI_MEMBER}" --role roles/iam.workloadIdentityUser \
     --condition=None --quiet
   log_success "Workload Identity configured."
@@ -491,8 +541,8 @@ main() {
   echo
   log_info "View controller logs with:"
   log_info "  kubectl --context=${DEST_CONTEXT} -n ${CONTROLLER_NAMESPACE} logs deploy/${CONTROLLER_DEPLOYMENT} -f"
-  log_info "If the logs show the source cluster can't be reached right after setup (e.g. new IAM"
-  log_info "bindings still propagating), restart the controller once they take effect:"
+  log_info "New IAM bindings can take a few minutes to propagate. If the logs show auth or permission"
+  log_info "errors right after setup, the controller retries with backoff; to retry immediately, run:"
   log_info "  kubectl --context=${DEST_CONTEXT} -n ${CONTROLLER_NAMESPACE} rollout restart deploy/${CONTROLLER_DEPLOYMENT}"
   log_info "If ${GSA_EMAIL} was granted access to a previous source project, revoke it with:"
   log_info "  ${MODULE_DIR}/cleanup.sh --dest-cluster ${DEST_CLUSTER} --dest-location ${DEST_LOCATION} --project ${PROJECT} --dest-context ${DEST_CONTEXT} --source-project <OLD_SOURCE_PROJECT>"
