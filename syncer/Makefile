@@ -1,6 +1,14 @@
 # Image URL to use all building/pushing image targets
 PROJECT_ID ?= $(shell gcloud config get-value project)
-IMG ?= gcr.io/${PROJECT_ID}/krmsyncer/controller:latest
+# Image goes to Artifact Registry in IMAGE_LOCATION, a region (e.g.
+# us-central1) or multi-region (us, europe, asia), matching deploy.sh's
+# --image-location. It defaults to the region of DEST_LOCATION (the
+# destination cluster's region or zone), derived with location_region from
+# lib.sh. Set IMAGE_LOCATION or IMG directly to override. The krmsyncer Docker
+# repository must exist in that location (deploy.sh creates it).
+DEST_LOCATION ?=
+IMAGE_LOCATION ?= $(if $(DEST_LOCATION),$(shell bash -c 'source ./lib.sh && location_region "$$1"' _ '$(DEST_LOCATION)'))
+IMG ?= $(if $(IMAGE_LOCATION),$(IMAGE_LOCATION)-docker.pkg.dev/$(PROJECT_ID)/krmsyncer/controller:latest)
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -42,12 +50,17 @@ manifests:
 generate:
 	controller-gen object paths="./..."
 
+# Fail early if no image is set (DEST_LOCATION, IMAGE_LOCATION or IMG).
+.PHONY: check-img
+check-img:
+	@test -n "$(IMG)" || { echo "Set DEST_LOCATION (e.g. make $(MAKECMDGOALS) DEST_LOCATION=us-central1-a), IMAGE_LOCATION or IMG" >&2; exit 1; }
+
 # Build the docker image
-docker-build: test
+docker-build: check-img test
 	docker build . -t ${IMG}
 
 # Push the docker image
-docker-push:
+docker-push: check-img
 	docker push ${IMG}
 
 # Install CRDs into a cluster
@@ -60,7 +73,7 @@ uninstall: manifests
 
 # Deploy controller in the configured Kubernetes cluster in ~/.kube/config.
 # The controller:latest placeholder in config/manager/manager.yaml is replaced with ${IMG}.
-deploy: manifests
+deploy: check-img manifests
 	kustomize build config/default | sed 's#image: controller:latest#image: ${IMG}#' | kubectl apply -f -
 
 ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
