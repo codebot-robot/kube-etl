@@ -19,7 +19,10 @@
 #   1. Configure Workload Identity: a Google Service Account (GSA) for the
 #      controller, impersonated by the controller's Kubernetes ServiceAccount,
 #      with roles/container.viewer on the source cluster's project.
-#   2. Build and push the controller image (skipped with --skip-build).
+#   2. Build and push the controller image (skipped with --skip-build). The
+#      default image goes to an Artifact Registry repository in the destination
+#      cluster's region, created if missing, and the destination cluster's
+#      node service accounts get roles/artifactregistry.reader on it.
 #   3. Check that the source cluster exists and that the selected control
 #      plane endpoint (Default, DNS or PrivateIP) is available.
 #   4. Deploy the KRMSyncer CRD, RBAC and controller to the destination cluster.
@@ -53,6 +56,9 @@ TEMPLATES_DIR="${MODULE_DIR}/config/templates"
 source "${MODULE_DIR}/lib.sh"
 
 IMAGE_PLACEHOLDER="controller:latest"
+
+# Artifact Registry Docker repository holding the default controller image.
+IMAGE_REPOSITORY="krmsyncer"
 
 # KRMSyncer CR rendered from config/templates/krmsyncer.yaml.
 SYNC_CONFIG_NAME="kcc-resource-syncer"
@@ -88,7 +94,9 @@ Flags:
       --project          GCP project of the destination cluster and the controller's
                          Google Service Account (required)
   -n, --namespace        Namespace for the KRMSyncer CR (default: ${CONTROLLER_NAMESPACE})
-  -i, --image            Controller image (default: gcr.io/<project>/krmsyncer/controller:latest)
+  -i, --image            Controller image (default:
+                         <dest-region>-docker.pkg.dev/<project>/${IMAGE_REPOSITORY}/controller:latest,
+                         where <dest-region> is the region of --dest-location)
       --skip-build       Do not build/push the image; deploy --image as is
   -h, --help             Show this help
 
@@ -178,7 +186,11 @@ complete() {
 
   resolve_dest_context
 
-  [[ -n "${IMAGE}" ]] || IMAGE="gcr.io/${PROJECT}/krmsyncer/controller:latest"
+  # Container Registry (gcr.io) is shut down, so the default image lives in an
+  # Artifact Registry repository in the destination cluster's region.
+  IMAGE_REGION="$(location_region "${DEST_LOCATION}")"
+  DEFAULT_IMAGE_REPO="${IMAGE_REGION}-docker.pkg.dev/${PROJECT}/${IMAGE_REPOSITORY}"
+  [[ -n "${IMAGE}" ]] || IMAGE="${DEFAULT_IMAGE_REPO}/controller:latest"
 
   DEST_ID="${PROJECT}/${DEST_LOCATION}/${DEST_CLUSTER}"
   GSA_NAME="$(gsa_name "${DEST_LOCATION}" "${DEST_CLUSTER}")"
@@ -216,6 +228,79 @@ render_template() {
     content="${content//"\${${kv%%=*}}"/"${kv#*=}"}"
   done
   printf '%s\n' "${content}"
+}
+
+# ensure_image_repository creates the Artifact Registry Docker repository for
+# the default image if it doesn't exist. Custom --image registries are left to
+# the user.
+ensure_image_repository() {
+  [[ "${IMAGE}" == "${DEFAULT_IMAGE_REPO}/"* ]] || return 0
+  if gcloud artifacts repositories describe "${IMAGE_REPOSITORY}" \
+      --location "${IMAGE_REGION}" --project "${PROJECT}" >/dev/null 2>&1; then
+    log_info "Artifact Registry repository ${DEFAULT_IMAGE_REPO} already exists."
+    return
+  fi
+  log_info "Creating Artifact Registry repository ${DEFAULT_IMAGE_REPO}..."
+  gcloud artifacts repositories create "${IMAGE_REPOSITORY}" \
+    --repository-format docker --location "${IMAGE_REGION}" --project "${PROJECT}" \
+    --description "KRMSyncer controller images" ||
+    die "failed to create Artifact Registry repository ${DEFAULT_IMAGE_REPO} (is the Artifact Registry API enabled? gcloud services enable artifactregistry.googleapis.com --project ${PROJECT})"
+}
+
+# node_service_accounts prints, one per line, the Google Service Accounts the
+# destination cluster's nodes run as: those of its node pools and the node
+# auto-provisioning (and Autopilot) default. "default" maps to the project's
+# Compute Engine default service account.
+node_service_accounts() {
+  local accounts sa project_number=""
+  accounts="$(
+    gcloud container node-pools list --cluster "${DEST_CLUSTER}" \
+      --location "${DEST_LOCATION}" --project "${PROJECT}" \
+      --format='value(config.serviceAccount)'
+    gcloud container clusters describe "${DEST_CLUSTER}" \
+      --location "${DEST_LOCATION}" --project "${PROJECT}" \
+      --format='value(autoscaling.autoprovisioningNodePoolDefaults.serviceAccount)'
+  )" || return 1
+  while IFS= read -r sa; do
+    [[ -n "${sa}" ]] || continue
+    if [[ "${sa}" == "default" ]]; then
+      [[ -n "${project_number}" ]] ||
+        project_number="$(gcloud projects describe "${PROJECT}" --format='value(projectNumber)')" || return 1
+      sa="${project_number}-compute@developer.gserviceaccount.com"
+    fi
+    printf '%s\n' "${sa}"
+  done <<<"${accounts}" | sort -u
+}
+
+# grant_image_pull_access grants the destination cluster's node service
+# accounts roles/artifactregistry.reader on the default image's repository, so
+# nodes can pull the controller image even when they run as a minimal custom
+# service account. Custom --image registries are left to the user.
+grant_image_pull_access() {
+  [[ "${IMAGE}" == "${DEFAULT_IMAGE_REPO}/"* ]] || return 0
+  if ! gcloud artifacts repositories describe "${IMAGE_REPOSITORY}" \
+      --location "${IMAGE_REGION}" --project "${PROJECT}" >/dev/null 2>&1; then
+    log_warn "Artifact Registry repository ${DEFAULT_IMAGE_REPO} not found; skipping image pull grants."
+    return
+  fi
+
+  local accounts
+  if ! accounts="$(node_service_accounts)" || [[ -z "${accounts}" ]]; then
+    log_warn "Could not determine the node service accounts of ${DEST_CLUSTER}; make sure they have"
+    log_warn "roles/artifactregistry.reader on ${DEFAULT_IMAGE_REPO}."
+    return
+  fi
+
+  local sa
+  while IFS= read -r sa; do
+    log_info "Granting roles/artifactregistry.reader on ${DEFAULT_IMAGE_REPO} to ${sa}..."
+    quiet gcloud artifacts repositories add-iam-policy-binding "${IMAGE_REPOSITORY}" \
+      --location "${IMAGE_REGION}" --project "${PROJECT}" \
+      --member "serviceAccount:${sa}" --role roles/artifactregistry.reader \
+      --condition=None --quiet ||
+      log_warn "failed to grant roles/artifactregistry.reader to ${sa}; nodes may fail to pull ${IMAGE}"
+  done <<<"${accounts}"
+  log_success "Node image pull access configured."
 }
 
 # quiet runs a command, printing its output only if it fails.
@@ -282,6 +367,7 @@ build_and_push_image() {
   log_info "Building controller image ${IMAGE} (Go ${go_version})..."
   docker build --platform linux/amd64 \
     --build-arg "GO_VERSION=${go_version}" -t "${IMAGE}" "${MODULE_DIR}"
+  ensure_image_repository
   log_info "Pushing controller image ${IMAGE}..."
   docker push "${IMAGE}" ||
     die "failed to push ${IMAGE} (you may need to run: gcloud auth configure-docker ${IMAGE%%/*})"
@@ -394,6 +480,7 @@ main() {
   configure_workload_identity
   log_header "Step 2: Build and Push Controller Image"
   build_and_push_image
+  grant_image_pull_access
   log_header "Step 3: Check Source Cluster"
   check_source_cluster
   log_header "Step 4: Deploy KRMSyncer Controller"

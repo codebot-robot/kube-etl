@@ -30,6 +30,19 @@ sha256_hex() {
   fi
 }
 
+# location_region prints the region of GKE location $1: zones
+# (e.g. us-central1-a) map to their region (us-central1), regions as is.
+# deploy.sh and the Makefile use it to pick the Artifact Registry region of the
+# controller image.
+location_region() {
+  local location="$1"
+  if [[ "${location}" =~ ^([a-z]+-[a-z]+[0-9]+)-[a-z]$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  else
+    printf '%s\n' "${location}"
+  fi
+}
+
 # gsa_name prints the name of the controller's Google Service Account for
 # destination cluster $2 in location $1: krmsyncer-<cluster prefix>-<hash>, at
 # most 29 characters (GSA IDs are limited to 30). The hash covers the location
