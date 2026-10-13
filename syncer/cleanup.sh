@@ -92,6 +92,11 @@ parse_flags() {
     case "${flag}" in
       -h|--help) usage; exit 0 ;;
       --dry-run) DRY_RUN="true"; shift; continue ;;
+      --dry-run=*)
+        DRY_RUN="$(bool_value "${flag#*=}")" ||
+          die "--dry-run takes no value, true or false (got \"${flag#*=}\")"
+        shift; continue
+        ;;
       --*=*)
         # Support --flag=value by splitting it into --flag value.
         set -- "${flag%%=*}" "${flag#*=}" "${@:2}"
@@ -128,7 +133,7 @@ check_deps() {
   done
 }
 
-complete() {
+resolve_defaults() {
   DEST_ID="${PROJECT}/${DEST_LOCATION}/${DEST_CLUSTER}"
   resolve_dest_context
   kube_dest get --raw /version >/dev/null ||
@@ -235,7 +240,7 @@ revoke() {
 main() {
   parse_flags "$@"
   check_deps
-  complete
+  resolve_defaults
   resolve_gsa
   find_projects_in_use
   find_candidates

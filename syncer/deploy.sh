@@ -16,15 +16,20 @@
 # deploy.sh installs KRMSyncer into the destination GKE cluster and
 # configures it to pull resources from the source GKE cluster:
 #
-#   1. Configure Workload Identity: a Google Service Account (GSA) for the
+#   1. Run read-only preflight checks, so misconfiguration fails before
+#      anything is created: Workload Identity is enabled on the destination
+#      cluster, the GSA (if it exists) belongs to it, the source cluster exists
+#      and the selected control plane endpoint (Default, DNS or PrivateIP) is
+#      available, the destination cluster is reachable and you can create
+#      cluster-scoped objects on it, the manifests render, and (unless
+#      --skip-build) Docker is running.
+#   2. Configure Workload Identity: a Google Service Account (GSA) for the
 #      controller, impersonated by the controller's Kubernetes ServiceAccount,
 #      with roles/container.viewer on the source cluster's project.
-#   2. Build and push the controller image (skipped with --skip-build). The
+#   3. Build and push the controller image (skipped with --skip-build). The
 #      default image goes to an Artifact Registry repository in the destination
 #      cluster's region, created if missing, and the destination cluster's
 #      node service accounts get roles/artifactregistry.reader on it.
-#   3. Check that the source cluster exists and that the selected control
-#      plane endpoint (Default, DNS or PrivateIP) is available.
 #   4. Deploy the KRMSyncer CRD, RBAC and controller to the destination cluster.
 #   5. Deploy the KRMSyncer configuration (config/templates/krmsyncer.yaml),
 #      which references the source cluster in spec.remote.gkeCluster.
@@ -121,12 +126,22 @@ NAMESPACE="${CONTROLLER_NAMESPACE}"
 IMAGE=""
 SKIP_BUILD="false"
 
+# Set by the preflight checks.
+GSA_EXISTS="false"
+MANIFESTS=""
+GO_VERSION=""
+
 parse_flags() {
   while [[ $# -gt 0 ]]; do
     local flag="$1"
     case "${flag}" in
       -h|--help) usage; exit 0 ;;
       --skip-build) SKIP_BUILD="true"; shift; continue ;;
+      --skip-build=*)
+        SKIP_BUILD="$(bool_value "${flag#*=}")" ||
+          die "--skip-build takes no value, true or false (got \"${flag#*=}\")"
+        shift; continue
+        ;;
       --*=*)
         # Support --flag=value by splitting it into --flag value.
         set -- "${flag%%=*}" "${flag#*=}" "${@:2}"
@@ -176,7 +191,7 @@ check_deps() {
   done
 }
 
-complete() {
+resolve_defaults() {
   [[ -f "${MODULE_DIR}/Dockerfile" && -d "${MODULE_DIR}/config/default" ]] ||
     die "${MODULE_DIR} is not the syncer directory (missing Dockerfile or config/default)"
 
@@ -357,9 +372,12 @@ retry_gsa_not_found() {
   return 1
 }
 
-# --- Steps -------------------------------------------------------------------
+# --- Preflight checks --------------------------------------------------------
+#
+# Read-only checks that run before anything is created or changed, so a
+# misconfiguration fails fast instead of leaving a partially provisioned setup.
 
-configure_workload_identity() {
+check_workload_identity() {
   log_info "Checking Workload Identity on destination cluster ${DEST_CLUSTER}..."
   local pool
   pool="$(gcloud container clusters describe "${DEST_CLUSTER}" \
@@ -369,7 +387,12 @@ configure_workload_identity() {
   gcloud container clusters update ${DEST_CLUSTER} --location ${DEST_LOCATION} --project ${PROJECT} --workload-pool=${PROJECT}.svc.id.goog
 (existing node pools also need --workload-metadata=GKE_METADATA)"
   log_success "Workload Identity enabled (pool: ${pool})."
+}
 
+# check_gsa sets GSA_EXISTS and fails if the GSA exists but belongs to another
+# destination cluster.
+check_gsa() {
+  log_info "Checking Google Service Account ${GSA_EMAIL}..."
   local description rc=0
   description="$(gcloud_describe gcloud iam service-accounts describe "${GSA_EMAIL}" \
     --project "${PROJECT}" --format='value(description)')" || rc=$?
@@ -377,51 +400,11 @@ configure_workload_identity() {
     0)
       [[ "${description}" == "$(gsa_description "${DEST_ID}")" ]] ||
         die "${GSA_EMAIL} exists but was not created by this script for ${DEST_ID} (description: \"${description}\")"
-      log_info "Google Service Account ${GSA_EMAIL} already exists."
+      GSA_EXISTS="true"
       ;;
-    1)
-      log_info "Creating Google Service Account ${GSA_EMAIL}..."
-      gcloud iam service-accounts create "${GSA_NAME}" --project "${PROJECT}" \
-        --display-name "KRMSyncer controller (${DEST_CLUSTER})" \
-        --description "$(gsa_description "${DEST_ID}")"
-      ;;
+    1) GSA_EXISTS="false" ;;
     *) die "cannot describe Google Service Account ${GSA_EMAIL}" ;;
   esac
-
-  # roles/container.viewer includes container.clusters.get (look up the source
-  # cluster's endpoint and CA, and authenticate to it), container.clusters.connect
-  # (needed for the DNS endpoint) and read access to Kubernetes objects in the
-  # project's clusters, so no RBAC objects are needed on the source cluster.
-  log_info "Granting roles/container.viewer on project ${SOURCE_PROJECT} to ${GSA_EMAIL}..."
-  retry_gsa_not_found gcloud projects add-iam-policy-binding "${SOURCE_PROJECT}" \
-    --member "serviceAccount:${GSA_EMAIL}" --role roles/container.viewer \
-    --condition=None --quiet
-
-  log_info "Allowing ${WI_MEMBER} to impersonate ${GSA_EMAIL}..."
-  retry_gsa_not_found gcloud iam service-accounts add-iam-policy-binding "${GSA_EMAIL}" --project "${PROJECT}" \
-    --member "${WI_MEMBER}" --role roles/iam.workloadIdentityUser \
-    --condition=None --quiet
-  log_success "Workload Identity configured."
-}
-
-build_and_push_image() {
-  if [[ "${SKIP_BUILD}" == "true" ]]; then
-    log_info "Skipping build; deploying ${IMAGE} as is."
-    return
-  fi
-
-  local go_version
-  go_version="$(awk '$1 == "go" && NF == 2 { print $2 }' "${MODULE_DIR}/go.mod")"
-  [[ -n "${go_version}" ]] || die "no go directive found in ${MODULE_DIR}/go.mod"
-
-  log_info "Building controller image ${IMAGE} (Go ${go_version})..."
-  docker build --platform linux/amd64 \
-    --build-arg "GO_VERSION=${go_version}" -t "${IMAGE}" "${MODULE_DIR}"
-  ensure_image_repository
-  log_info "Pushing controller image ${IMAGE}..."
-  docker push "${IMAGE}" ||
-    die "failed to push ${IMAGE} (you may need to run: gcloud auth configure-docker ${IMAGE%%/*})"
-  log_success "Controller image pushed."
 }
 
 # print_reachability_hint prints a command that tests, from inside the
@@ -474,20 +457,94 @@ or use --source-endpoint Default or PrivateIP"
   log_success "Source cluster found."
 }
 
-deploy_controller() {
-  local config_dir="${MODULE_DIR}/config/default"
-  log_info "Rendering manifests from ${config_dir}..."
-  local manifests
-  manifests="$(kubectl kustomize "${config_dir}")"
-  [[ "${manifests}" == *"image: ${IMAGE_PLACEHOLDER}"* ]] ||
-    die "image \"${IMAGE_PLACEHOLDER}\" not found in rendered manifests; check config/manager/manager.yaml"
-
-  log_info "Verifying destination cluster connectivity..."
+# check_dest_cluster checks that the destination cluster is reachable and that
+# you can create the cluster-scoped objects of the controller.
+check_dest_cluster() {
+  log_info "Checking access to destination cluster ${DEST_CONTEXT}..."
   kube_dest get --raw /version >/dev/null ||
     die "cannot reach destination cluster with context \"${DEST_CONTEXT}\""
+  local resource
+  for resource in customresourcedefinitions.apiextensions.k8s.io \
+      clusterroles.rbac.authorization.k8s.io clusterrolebindings.rbac.authorization.k8s.io; do
+    [[ "$(kube_dest auth can-i create "${resource}" 2>/dev/null)" == "yes" ]] ||
+      die "you cannot create ${resource} in the destination cluster (roles/container.admin or cluster-admin is needed)"
+  done
+}
 
+# render_manifests renders the controller manifests into MANIFESTS.
+render_manifests() {
+  local config_dir="${MODULE_DIR}/config/default"
+  log_info "Rendering manifests from ${config_dir}..."
+  MANIFESTS="$(kubectl kustomize "${config_dir}")"
+  [[ "${MANIFESTS}" == *"image: ${IMAGE_PLACEHOLDER}"* ]] ||
+    die "image \"${IMAGE_PLACEHOLDER}\" not found in rendered manifests; check config/manager/manager.yaml"
+  [[ -f "${TEMPLATES_DIR}/krmsyncer.yaml" ]] || die "${TEMPLATES_DIR}/krmsyncer.yaml not found"
+}
+
+# check_build sets GO_VERSION and checks that Docker can build the image.
+check_build() {
+  GO_VERSION="$(awk '$1 == "go" && NF == 2 { print $2 }' "${MODULE_DIR}/go.mod")"
+  [[ -n "${GO_VERSION}" ]] || die "no go directive found in ${MODULE_DIR}/go.mod"
+  docker info >/dev/null 2>&1 || die "cannot connect to the Docker daemon; is it running?"
+}
+
+preflight_checks() {
+  check_workload_identity
+  check_gsa
+  check_source_cluster
+  check_dest_cluster
+  render_manifests
+  [[ "${SKIP_BUILD}" == "true" ]] || check_build
+  log_success "Preflight checks passed."
+}
+
+# --- Steps -------------------------------------------------------------------
+
+configure_workload_identity() {
+  if [[ "${GSA_EXISTS}" == "true" ]]; then
+    log_info "Google Service Account ${GSA_EMAIL} already exists."
+  else
+    log_info "Creating Google Service Account ${GSA_EMAIL}..."
+    gcloud iam service-accounts create "${GSA_NAME}" --project "${PROJECT}" \
+      --display-name "KRMSyncer controller (${DEST_CLUSTER})" \
+      --description "$(gsa_description "${DEST_ID}")"
+  fi
+
+  # roles/container.viewer includes container.clusters.get (look up the source
+  # cluster's endpoint and CA, and authenticate to it), container.clusters.connect
+  # (needed for the DNS endpoint) and read access to Kubernetes objects in the
+  # project's clusters, so no RBAC objects are needed on the source cluster.
+  log_info "Granting roles/container.viewer on project ${SOURCE_PROJECT} to ${GSA_EMAIL}..."
+  retry_gsa_not_found gcloud projects add-iam-policy-binding "${SOURCE_PROJECT}" \
+    --member "serviceAccount:${GSA_EMAIL}" --role roles/container.viewer \
+    --condition=None --quiet
+
+  log_info "Allowing ${WI_MEMBER} to impersonate ${GSA_EMAIL}..."
+  retry_gsa_not_found gcloud iam service-accounts add-iam-policy-binding "${GSA_EMAIL}" --project "${PROJECT}" \
+    --member "${WI_MEMBER}" --role roles/iam.workloadIdentityUser \
+    --condition=None --quiet
+  log_success "Workload Identity configured."
+}
+
+build_and_push_image() {
+  if [[ "${SKIP_BUILD}" == "true" ]]; then
+    log_info "Skipping build; deploying ${IMAGE} as is."
+    return
+  fi
+
+  log_info "Building controller image ${IMAGE} (Go ${GO_VERSION})..."
+  docker build --platform linux/amd64 \
+    --build-arg "GO_VERSION=${GO_VERSION}" -t "${IMAGE}" "${MODULE_DIR}"
+  ensure_image_repository
+  log_info "Pushing controller image ${IMAGE}..."
+  docker push "${IMAGE}" ||
+    die "failed to push ${IMAGE} (you may need to run: gcloud auth configure-docker ${IMAGE%%/*})"
+  log_success "Controller image pushed."
+}
+
+deploy_controller() {
   log_info "Applying CRD, RBAC and controller Deployment..."
-  printf '%s\n' "${manifests//"image: ${IMAGE_PLACEHOLDER}"/"image: ${IMAGE}"}" | kube_dest apply -f -
+  printf '%s\n' "${MANIFESTS//"image: ${IMAGE_PLACEHOLDER}"/"image: ${IMAGE}"}" | kube_dest apply -f -
 
   log_info "Annotating ServiceAccount for Workload Identity..."
   kube_dest -n "${CONTROLLER_NAMESPACE}" annotate serviceaccount "${CONTROLLER_KSA}" \
@@ -505,7 +562,7 @@ deploy_controller() {
 
 deploy_sync_config() {
   log_info "Applying KRMSyncer ${NAMESPACE}/${SYNC_CONFIG_NAME}..."
-  kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kube_dest apply -f - >/dev/null
+  kube_dest create namespace "${NAMESPACE}" --dry-run=client -o yaml | kube_dest apply -f - >/dev/null
   render_template "${TEMPLATES_DIR}/krmsyncer.yaml" \
     "SYNC_CONFIG_NAME=${SYNC_CONFIG_NAME}" \
     "NAMESPACE=${NAMESPACE}" \
@@ -521,18 +578,18 @@ deploy_sync_config() {
 main() {
   parse_flags "$@"
   check_deps
-  complete
+  resolve_defaults
   print_summary
 
+  log_header "Step 1: Preflight Checks"
+  preflight_checks
   # Workload Identity runs before the image build: new IAM bindings can take a
   # few minutes to propagate, and the build gives them time.
-  log_header "Step 1: Configure Workload Identity"
+  log_header "Step 2: Configure Workload Identity"
   configure_workload_identity
-  log_header "Step 2: Build and Push Controller Image"
+  log_header "Step 3: Build and Push Controller Image"
   build_and_push_image
   grant_image_pull_access
-  log_header "Step 3: Check Source Cluster"
-  check_source_cluster
   log_header "Step 4: Deploy KRMSyncer Controller"
   deploy_controller
   log_header "Step 5: Deploy KRMSyncer Configuration"

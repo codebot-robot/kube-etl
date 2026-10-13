@@ -1,6 +1,6 @@
 # KRMSyncer
 
-The KRMSyncer is a Kubernetes-native tool designed for multi-cluster KRM resources synchronization.
+The KRMSyncer is a Kubernetes-native tool designed for multi-cluster synchronization of KRM resources.
 
 ## Features
 
@@ -38,10 +38,10 @@ spec:
   suspend: false
   mode: pull # Defaults to 'pull'.
   rules:
-    - group: ""
+    - group: "pubsub.cnrm.cloud.google.com"
       version: "v1"
       kind: "PubsubTopic"
-      namespaces: ["default"] # Only sync PubsubTopic in the 'default' namespace
+      namespaces: ["default"] # Only sync PubsubTopic resources in the 'default' namespace
   remote:
     gkeCluster:
       project: my-project
@@ -55,6 +55,7 @@ spec:
 - `DNS`: the cluster's DNS-based endpoint. It must be enabled for external traffic (`gcloud container clusters update --enable-dns-access`); needs no VPC connectivity, and is unaffected by credential rotation.
 - `PrivateIP`: the cluster's private endpoint. The controller must be able to reach the cluster's VPC.
 ## Run Integration test
+
 ```bash
 # Build the manager binary
 cd syncer
@@ -90,6 +91,9 @@ Before running [`deploy.sh`](deploy.sh), make sure you have the following.
 
 - The source cluster must expose the endpoint you select with `--source-endpoint`, and the destination cluster must be able to reach it (see [Network access to the source cluster](#network-access-to-the-source-cluster)).
 - To use the sample `KRMSyncer` CR, destination cluster needs the Config Connector CRDs installed for all the resources in the source cluster.
+
+> [!WARNING]
+> **The destination cluster must be passive.** The sample `KRMSyncer` CR syncs the `spec` and `status` of every Config Connector resource from the source cluster into the destination cluster. If Config Connector is running in the destination cluster, and not just installed as CRDs, both clusters reconcile the same GCP resources and fight over them.
 
 ### Network access to the source cluster
 
@@ -187,18 +191,21 @@ cd syncer
 
 `-n` sets the namespace for the `KRMSyncer` CR (default: `krmsyncer-system`, the same namespace as the controller).
 
-`-i` sets the controller image to deploy. Default to `<dest-region>-docker.pkg.dev/<project>/krmsyncer/controller:latest`, where `<dest-region>` is the region of `--dest-location` (Container Registry, `gcr.io`, is shut down).
+`-i` sets the controller image to deploy. Defaults to `<dest-region>-docker.pkg.dev/<project>/krmsyncer/controller:latest`, where `<dest-region>` is the region of `--dest-location` (Container Registry, `gcr.io`, is shut down).
 
 `--skip-build` deploys the image as is, without building and pushing it.
 
 This command:
-1. Configures Workload Identity. It creates a Google Service Account (GSA) for the destination cluster, `krmsyncer-<dest-cluster>-<hash>@<project>.iam.gserviceaccount.com` (up to 12 characters of the cluster name plus a hash of its location and name, to stay within the 30-character limit on GSA names). It grants the GSA `roles/container.viewer` on the source cluster's project, and lets the controller's `krmsyncer-system/krmsyncer-controller-manager` Kubernetes ServiceAccount impersonate it. `roles/container.viewer` lets the GSA look up the source cluster, connect to it (including over the DNS endpoint) and read its Kubernetes objects.
-2. Builds and pushes the controller image (unless `--skip-build` is set). With the default image, it first creates the `krmsyncer` Docker repository in Artifact Registry if it doesn't exist. It then grants the destination cluster's node service accounts (those of its node pools and the node auto-provisioning/Autopilot default) `roles/artifactregistry.reader` on that repository, so nodes can pull the image even when they run as a minimal custom service account; this also runs with `--skip-build`.
-3. Checks that the source cluster exists and exposes the selected endpoint.
+1. Runs read-only preflight checks, so a misconfiguration fails before anything is created: Workload Identity is enabled on the destination cluster, the GSA (if it already exists) was created for this destination cluster, the source cluster exists and exposes the selected endpoint, the destination cluster is reachable and you can create CRDs and cluster RBAC on it, the manifests render, and (unless `--skip-build` is set) Docker is running.
+2. Configures Workload Identity. It creates a Google Service Account (GSA) for the destination cluster, `krmsyncer-<dest-cluster>-<hash>@<project>.iam.gserviceaccount.com` (up to 12 characters of the cluster name plus a hash of its location and name, to stay within the 30-character limit on GSA names). It grants the GSA `roles/container.viewer` on the source cluster's project, and lets the controller's `krmsyncer-system/krmsyncer-controller-manager` Kubernetes ServiceAccount impersonate it. `roles/container.viewer` lets the GSA look up the source cluster, connect to it (including over the DNS endpoint) and read its Kubernetes objects.
+3. Builds and pushes the controller image (unless `--skip-build` is set). With the default image, it first creates the `krmsyncer` Docker repository in Artifact Registry if it doesn't exist. It then grants the destination cluster's node service accounts (those of its node pools and the node auto-provisioning/Autopilot default) `roles/artifactregistry.reader` on that repository, so nodes can pull the image even when they run as a minimal custom service account; this also runs with `--skip-build`.
 4. Deploys the RBAC, KRMSyncer CRD and controller into the `krmsyncer-system` namespace of the destination cluster, and annotates the controller's ServiceAccount with the GSA.
 5. Applies the `kcc-resource-syncer` `KRMSyncer` CR from [`config/templates/krmsyncer.yaml`](config/templates/krmsyncer.yaml). It references the source cluster in `spec.remote.gkeCluster` and syncs all Config Connector resources from it. The destination cluster needs the matching KCC CRDs pre-installed.
 
 The script only adds IAM bindings. If you re-run it with a different `--source-project`, the GSA keeps its access to the previous source project until you revoke it with [`cleanup.sh`](cleanup.sh) (see [Cleaning up IAM bindings](#cleaning-up-iam-bindings)).
+
+> [!WARNING]
+> All `KRMSyncer` objects share the controller's Google identity. Anyone who can create a `KRMSyncer` can sync with any cluster that identity can access (with `roles/container.viewer`, every cluster in the source project and in any project it was previously granted), so restrict who can create `KRMSyncer` objects.
 
 View the controller logs with:
 ```bash
@@ -242,7 +249,13 @@ Revoke the project grants **before** deleting the GSA. A deleted GSA has no acce
 ### 2. Verify the Results
 1. Create a test resource in the Source cluster:
    ```bash
-   kubectl create pubsubtopic test-topic
+   kubectl --context=<source-cluster-context> apply -f - <<EOF
+   apiVersion: pubsub.cnrm.cloud.google.com/v1beta1
+   kind: PubSubTopic
+   metadata:
+     name: test-topic
+     namespace: default
+   EOF
    ```
 
 1. Check the Destination cluster:

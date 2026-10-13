@@ -22,6 +22,15 @@ KRMSYNCER_CRD="krmsyncers.syncer.gkelabs.io"
 # Kubernetes ServiceAccount of the controller (config/rbac/service_account.yaml).
 CONTROLLER_KSA="krmsyncer-controller-manager"
 
+# bool_value prints the value of a boolean flag given as --flag=$1: "true" or
+# "false". It returns 1 for any other value.
+bool_value() {
+  case "$1" in
+    true|false) printf '%s\n' "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
 sha256_hex() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum | awk '{ print $1 }'
