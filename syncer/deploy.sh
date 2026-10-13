@@ -27,9 +27,10 @@
 #      controller, impersonated by the controller's Kubernetes ServiceAccount,
 #      with roles/container.viewer on the source cluster's project.
 #   3. Build and push the controller image (skipped with --skip-build). The
-#      default image goes to an Artifact Registry repository in the destination
-#      cluster's region, created if missing, and the destination cluster's
-#      node service accounts get roles/artifactregistry.reader on it.
+#      default image goes to an Artifact Registry repository in
+#      --image-location (default: the destination cluster's region), created
+#      if missing, and the destination cluster's node service accounts get
+#      roles/artifactregistry.reader on it.
 #   4. Deploy the KRMSyncer CRD, RBAC and controller to the destination cluster.
 #   5. Deploy the KRMSyncer configuration (config/templates/krmsyncer.yaml),
 #      which references the source cluster in spec.remote.gkeCluster.
@@ -68,14 +69,6 @@ IMAGE_REPOSITORY="krmsyncer"
 # KRMSyncer CR rendered from config/templates/krmsyncer.yaml.
 SYNC_CONFIG_NAME="kcc-resource-syncer"
 
-# --- Logging -----------------------------------------------------------------
-
-log_info()    { echo -e "\033[0;34m[INFO]\033[0m $*"; }
-log_warn()    { echo -e "\033[0;33m[WARN]\033[0m $*" >&2; }
-log_success() { echo -e "\033[0;32m[OK]\033[0m $*"; }
-log_header()  { echo -e "\n\033[1;36m=== $* ===\033[0m"; }
-die()         { echo -e "\033[0;31m[ERROR]\033[0m $*" >&2; exit 1; }
-
 usage() {
   cat <<EOF
 Usage: $(basename "$0") --source-cluster <NAME> --source-location <LOCATION> \\
@@ -100,8 +93,10 @@ Flags:
                          Google Service Account (required)
   -n, --namespace        Namespace for the KRMSyncer CR (default: ${CONTROLLER_NAMESPACE})
   -i, --image            Controller image (default:
-                         <dest-region>-docker.pkg.dev/<project>/${IMAGE_REPOSITORY}/controller:latest,
-                         where <dest-region> is the region of --dest-location)
+                         <image-location>-docker.pkg.dev/<project>/${IMAGE_REPOSITORY}/controller:latest)
+      --image-location   Artifact Registry location of the default image: a region
+                         (e.g. us-central1) or multi-region (us, europe, asia)
+                         (default: the region of --dest-location); ignored with --image
       --skip-build       Do not build/push the image; deploy --image as is
   -h, --help             Show this help
 
@@ -124,6 +119,7 @@ DEST_CONTEXT=""
 PROJECT=""
 NAMESPACE="${CONTROLLER_NAMESPACE}"
 IMAGE=""
+IMAGE_LOCATION=""
 SKIP_BUILD="false"
 
 # Set by the preflight checks.
@@ -160,6 +156,7 @@ parse_flags() {
       --project)         PROJECT="$2" ;;
       -n|--namespace)    NAMESPACE="$2" ;;
       -i|--image)        IMAGE="$2" ;;
+      --image-location)  IMAGE_LOCATION="$2" ;;
       *) usage >&2; die "unknown flag: ${flag}" ;;
     esac
     shift 2
@@ -201,10 +198,10 @@ resolve_defaults() {
 
   resolve_dest_context
 
-  # Container Registry (gcr.io) is shut down, so the default image lives in an
-  # Artifact Registry repository in the destination cluster's region.
-  IMAGE_REGION="$(location_region "${DEST_LOCATION}")"
-  DEFAULT_IMAGE_REPO="${IMAGE_REGION}-docker.pkg.dev/${PROJECT}/${IMAGE_REPOSITORY}"
+  # The default image lives in an Artifact Registry repository in
+  # --image-location, by default the destination cluster's region.
+  [[ -n "${IMAGE_LOCATION}" ]] || IMAGE_LOCATION="$(location_region "${DEST_LOCATION}")"
+  DEFAULT_IMAGE_REPO="${IMAGE_LOCATION}-docker.pkg.dev/${PROJECT}/${IMAGE_REPOSITORY}"
   [[ -n "${IMAGE}" ]] || IMAGE="${DEFAULT_IMAGE_REPO}/controller:latest"
 
   DEST_ID="${PROJECT}/${DEST_LOCATION}/${DEST_CLUSTER}"
@@ -230,8 +227,6 @@ print_summary() {
 
 # --- Helpers -----------------------------------------------------------------
 
-kube_dest() { kubectl --context="${DEST_CONTEXT}" "$@"; }
-
 # render_template prints a template with ${KEY} placeholders replaced.
 # Usage: render_template <file> KEY=value...
 render_template() {
@@ -252,7 +247,7 @@ ensure_image_repository() {
   [[ "${IMAGE}" == "${DEFAULT_IMAGE_REPO}/"* ]] || return 0
   local rc=0
   gcloud_describe gcloud artifacts repositories describe "${IMAGE_REPOSITORY}" \
-    --location "${IMAGE_REGION}" --project "${PROJECT}" >/dev/null || rc=$?
+    --location "${IMAGE_LOCATION}" --project "${PROJECT}" >/dev/null || rc=$?
   case "${rc}" in
     0)
       log_info "Artifact Registry repository ${DEFAULT_IMAGE_REPO} already exists."
@@ -263,7 +258,7 @@ ensure_image_repository() {
   esac
   log_info "Creating Artifact Registry repository ${DEFAULT_IMAGE_REPO}..."
   gcloud artifacts repositories create "${IMAGE_REPOSITORY}" \
-    --repository-format docker --location "${IMAGE_REGION}" --project "${PROJECT}" \
+    --repository-format docker --location "${IMAGE_LOCATION}" --project "${PROJECT}" \
     --description "KRMSyncer controller images" ||
     die "failed to create Artifact Registry repository ${DEFAULT_IMAGE_REPO} (is the Artifact Registry API enabled? gcloud services enable artifactregistry.googleapis.com --project ${PROJECT})"
 }
@@ -300,7 +295,7 @@ node_service_accounts() {
 grant_image_pull_access() {
   [[ "${IMAGE}" == "${DEFAULT_IMAGE_REPO}/"* ]] || return 0
   if ! gcloud artifacts repositories describe "${IMAGE_REPOSITORY}" \
-      --location "${IMAGE_REGION}" --project "${PROJECT}" >/dev/null 2>&1; then
+      --location "${IMAGE_LOCATION}" --project "${PROJECT}" >/dev/null 2>&1; then
     log_warn "Artifact Registry repository ${DEFAULT_IMAGE_REPO} not found; skipping image pull grants."
     return
   fi
@@ -316,7 +311,7 @@ grant_image_pull_access() {
   while IFS= read -r sa; do
     log_info "Granting roles/artifactregistry.reader on ${DEFAULT_IMAGE_REPO} to ${sa}..."
     quiet gcloud artifacts repositories add-iam-policy-binding "${IMAGE_REPOSITORY}" \
-      --location "${IMAGE_REGION}" --project "${PROJECT}" \
+      --location "${IMAGE_LOCATION}" --project "${PROJECT}" \
       --member "serviceAccount:${sa}" --role roles/artifactregistry.reader \
       --condition=None --quiet ||
       log_warn "failed to grant roles/artifactregistry.reader to ${sa}; nodes may fail to pull ${IMAGE}"

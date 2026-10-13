@@ -22,6 +22,19 @@ KRMSYNCER_CRD="krmsyncers.syncer.gkelabs.io"
 # Kubernetes ServiceAccount of the controller (config/rbac/service_account.yaml).
 CONTROLLER_KSA="krmsyncer-controller-manager"
 
+# --- Logging -----------------------------------------------------------------
+
+log_info()    { echo -e "\033[0;34m[INFO]\033[0m $*"; }
+log_warn()    { echo -e "\033[0;33m[WARN]\033[0m $*" >&2; }
+log_success() { echo -e "\033[0;32m[OK]\033[0m $*"; }
+log_header()  { echo -e "\n\033[1;36m=== $* ===\033[0m"; }
+die()         { echo -e "\033[0;31m[ERROR]\033[0m $*" >&2; exit 1; }
+
+# --- Helpers -----------------------------------------------------------------
+
+# kube_dest runs kubectl against the destination cluster (DEST_CONTEXT).
+kube_dest() { kubectl --context="${DEST_CONTEXT}" "$@"; }
+
 # bool_value prints the value of a boolean flag given as --flag=$1: "true" or
 # "false". It returns 1 for any other value.
 bool_value() {
@@ -41,8 +54,8 @@ sha256_hex() {
 
 # location_region prints the region of GKE location $1: zones
 # (e.g. us-central1-a) map to their region (us-central1), regions as is.
-# deploy.sh and the Makefile use it to pick the Artifact Registry region of the
-# controller image.
+# deploy.sh and the Makefile use it for the default Artifact Registry location
+# of the controller image (--image-location / IMAGE_LOCATION).
 location_region() {
   local location="$1"
   if [[ "${location}" =~ ^([a-z]+-[a-z]+[0-9]+)-[a-z]$ ]]; then

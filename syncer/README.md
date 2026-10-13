@@ -39,7 +39,7 @@ spec:
   mode: pull # Defaults to 'pull'.
   rules:
     - group: "pubsub.cnrm.cloud.google.com"
-      version: "v1"
+      version: "v1beta1"
       kind: "PubsubTopic"
       namespaces: ["default"] # Only sync PubsubTopic resources in the 'default' namespace
   remote:
@@ -62,9 +62,10 @@ cd syncer
 make test-integration
 ```
 
-To build and push the controller image without `deploy.sh`, set `DEST_LOCATION` to the destination cluster's region or zone. The image goes to `<dest-region>-docker.pkg.dev/<project>/krmsyncer/controller:latest`, the same default `deploy.sh` uses, so the `krmsyncer` repository must already exist. Set `REGION` or `IMG` to override it:
+To build and push the controller image without `deploy.sh`, set `DEST_LOCATION` to the destination cluster's region or zone. The image goes to `<dest-region>-docker.pkg.dev/<project>/krmsyncer/controller:latest`, the same default `deploy.sh` uses, so the `krmsyncer` repository must already exist. Set `IMAGE_LOCATION` to use another Artifact Registry region or multi-region, or `IMG` to set the image directly:
 ```bash
 make docker-build docker-push DEST_LOCATION=us-central1-a
+make docker-build docker-push IMAGE_LOCATION=us
 ```
 
 ## Getting Started
@@ -77,7 +78,7 @@ Before running [`deploy.sh`](deploy.sh), make sure you have the following.
 
 - `kubectl`, `gcloud`, and `docker`.
 - [`gke-gcloud-auth-plugin`](https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl#install_plugin), so your local `kubectl` context can authenticate to the destination cluster.
-- Push access to the image registry (e.g. `gcloud auth configure-docker <dest-region>-docker.pkg.dev`). With the default image, the script creates the `krmsyncer` Artifact Registry repository if needed, which requires the Artifact Registry API to be enabled in the project.
+- Push access to the image registry (e.g. `gcloud auth configure-docker <image-location>-docker.pkg.dev`). With the default image, the script creates the `krmsyncer` Artifact Registry repository if needed, which requires the Artifact Registry API to be enabled in the project.
 
 **Clusters**
 
@@ -179,7 +180,7 @@ cd syncer
   [--source-project <SOURCE_PROJECT_ID>] \
   [--source-endpoint Default|DNS|PrivateIP] \
   [-n <NAMESPACE>] \
-  [-i <IMAGE>] \
+  [-i <IMAGE> | --image-location <LOCATION>] \
   [--skip-build]
 ```
 
@@ -191,14 +192,16 @@ cd syncer
 
 `-n` sets the namespace for the `KRMSyncer` CR (default: `krmsyncer-system`, the same namespace as the controller).
 
-`-i` sets the controller image to deploy. Defaults to `<dest-region>-docker.pkg.dev/<project>/krmsyncer/controller:latest`, where `<dest-region>` is the region of `--dest-location` (Container Registry, `gcr.io`, is shut down).
+`-i` sets the controller image to deploy. Defaults to `<image-location>-docker.pkg.dev/<project>/krmsyncer/controller:latest` (Container Registry, `gcr.io`, is shut down).
+
+`--image-location` sets the Artifact Registry location of the default image: a region (e.g. `us-central1`) or a multi-region (`us`, `europe`, `asia`). Defaults to the region of `--dest-location`. Ignored if `-i` is set.
 
 `--skip-build` deploys the image as is, without building and pushing it.
 
 This command:
 1. Runs read-only preflight checks, so a misconfiguration fails before anything is created: Workload Identity is enabled on the destination cluster, the GSA (if it already exists) was created for this destination cluster, the source cluster exists and exposes the selected endpoint, the destination cluster is reachable and you can create CRDs and cluster RBAC on it, the manifests render, and (unless `--skip-build` is set) Docker is running.
 2. Configures Workload Identity. It creates a Google Service Account (GSA) for the destination cluster, `krmsyncer-<dest-cluster>-<hash>@<project>.iam.gserviceaccount.com` (up to 12 characters of the cluster name plus a hash of its location and name, to stay within the 30-character limit on GSA names). It grants the GSA `roles/container.viewer` on the source cluster's project, and lets the controller's `krmsyncer-system/krmsyncer-controller-manager` Kubernetes ServiceAccount impersonate it. `roles/container.viewer` lets the GSA look up the source cluster, connect to it (including over the DNS endpoint) and read its Kubernetes objects.
-3. Builds and pushes the controller image (unless `--skip-build` is set). With the default image, it first creates the `krmsyncer` Docker repository in Artifact Registry if it doesn't exist. It then grants the destination cluster's node service accounts (those of its node pools and the node auto-provisioning/Autopilot default) `roles/artifactregistry.reader` on that repository, so nodes can pull the image even when they run as a minimal custom service account; this also runs with `--skip-build`.
+3. Builds and pushes the controller image (unless `--skip-build` is set). With the default image, it first creates the `krmsyncer` Docker repository in Artifact Registry in `--image-location` if it doesn't exist. It then grants the destination cluster's node service accounts (those of its node pools and the node auto-provisioning/Autopilot default) `roles/artifactregistry.reader` on that repository, so nodes can pull the image even when they run as a minimal custom service account; this also runs with `--skip-build`.
 4. Deploys the RBAC, KRMSyncer CRD and controller into the `krmsyncer-system` namespace of the destination cluster, and annotates the controller's ServiceAccount with the GSA.
 5. Applies the `kcc-resource-syncer` `KRMSyncer` CR from [`config/templates/krmsyncer.yaml`](config/templates/krmsyncer.yaml). It references the source cluster in `spec.remote.gkeCluster` and syncs all Config Connector resources from it. The destination cluster needs the matching KCC CRDs pre-installed.
 

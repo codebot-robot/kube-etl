@@ -43,13 +43,6 @@ source "${MODULE_DIR}/lib.sh"
 
 VIEWER_ROLE="roles/container.viewer"
 
-# --- Logging -----------------------------------------------------------------
-
-log_info()    { echo -e "\033[0;34m[INFO]\033[0m $*"; }
-log_warn()    { echo -e "\033[0;33m[WARN]\033[0m $*" >&2; }
-log_success() { echo -e "\033[0;32m[OK]\033[0m $*"; }
-die()         { echo -e "\033[0;31m[ERROR]\033[0m $*" >&2; exit 1; }
-
 usage() {
   cat <<EOF
 Usage: $(basename "$0") --dest-cluster <NAME> --dest-location <LOCATION> --project <PROJECT> \\
@@ -141,8 +134,6 @@ resolve_defaults() {
 }
 
 # --- Helpers -----------------------------------------------------------------
-
-kube_dest() { kubectl --context="${DEST_CONTEXT}" "$@"; }
 
 # contains returns whether $1 is one of the remaining arguments.
 contains() {
