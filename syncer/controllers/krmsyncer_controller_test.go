@@ -561,6 +561,9 @@ func TestFilterFields(t *testing.T) {
 				"labels": map[string]any{
 					"l1": "v1",
 				},
+				"annotations": map[string]any{
+					"a1": "v1",
+				},
 			},
 			"spec": map[string]any{
 				"resourceID": "id1",
@@ -595,7 +598,14 @@ func TestFilterFields(t *testing.T) {
 	assert.Equal(t, "Active", status["phase"])
 
 	assert.Equal(t, "test", dest.GetName())
-	assert.Equal(t, "v1", dest.GetLabels()["l1"])
+	assert.Equal(t, "default", dest.GetNamespace())
+	// Status mode: labels and annotations must not be synced.
+	assert.Nil(t, dest.GetLabels())
+	assert.Nil(t, dest.GetAnnotations())
+	_, found, _ = unstructured.NestedFieldNoCopy(dest.Object, "metadata", "labels")
+	assert.False(t, found)
+	_, found, _ = unstructured.NestedFieldNoCopy(dest.Object, "metadata", "annotations")
+	assert.False(t, found)
 
 	// Test case 2: Sync full "spec" with nested fields of various types
 	srcFull := &unstructured.Unstructured{
@@ -604,6 +614,12 @@ func TestFilterFields(t *testing.T) {
 			"kind":       "ConfigMap",
 			"metadata": map[string]any{
 				"name": "full-spec-test",
+				"labels": map[string]any{
+					"l1": "v1",
+				},
+				"annotations": map[string]any{
+					"a1": "v1",
+				},
 			},
 			"spec": map[string]any{
 				"primitive": "string-val",
@@ -626,6 +642,10 @@ func TestFilterFields(t *testing.T) {
 	fieldsFull := []string{"spec"}
 	destFull, err := dr.filterFields(srcFull, fieldsFull)
 	assert.NoError(t, err)
+
+	// Full mode: labels and annotations are synced.
+	assert.Equal(t, map[string]string{"l1": "v1"}, destFull.GetLabels())
+	assert.Equal(t, map[string]string{"a1": "v1"}, destFull.GetAnnotations())
 
 	spec, found, _ := unstructured.NestedMap(destFull.Object, "spec")
 	assert.True(t, found)
