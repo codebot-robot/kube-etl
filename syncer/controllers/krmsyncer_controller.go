@@ -530,8 +530,12 @@ func (r *DynamicResourceReconciler) filterFields(src *unstructured.Unstructured,
 	dest.SetGroupVersionKind(src.GroupVersionKind())
 	dest.SetName(src.GetName())
 	dest.SetNamespace(src.GetNamespace())
-	dest.SetLabels(src.GetLabels())
-	dest.SetAnnotations(src.GetAnnotations())
+	// Labels and annotations are only synced in full mode (when "spec" is synced).
+	// In status mode, the destination object's metadata is left untouched.
+	if isFullSync(fields) {
+		dest.SetLabels(src.GetLabels())
+		dest.SetAnnotations(src.GetAnnotations())
+	}
 
 	for _, field := range fields {
 		parts := strings.Split(field, ".")
@@ -546,6 +550,17 @@ func (r *DynamicResourceReconciler) filterFields(src *unstructured.Unstructured,
 		}
 	}
 	return dest, nil
+}
+
+// isFullSync reports whether the sync fields include the full "spec". Otherwise the
+// syncer is in status mode (e.g. "status", optionally with "spec.resourceID").
+func isFullSync(fields []string) bool {
+	for _, field := range fields {
+		if field == "spec" {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, destClient client.Client, obj *unstructured.Unstructured) error {
