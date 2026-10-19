@@ -330,7 +330,7 @@ func (r *KRMSyncerReconciler) getOrCreateRemoteCluster(ctx context.Context, key,
 
 	c, err := cluster.New(restConfig, func(o *cluster.Options) {
 		o.Scheme = r.Scheme
-		if r.SyncPeriod != nil {
+		if r.SyncPeriod != nil && *r.SyncPeriod > 0 {
 			o.Cache.SyncPeriod = r.SyncPeriod
 		}
 	})

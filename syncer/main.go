@@ -57,7 +57,7 @@ func main() {
 
 func run(ctx context.Context) error {
 	var syncPeriod time.Duration
-	flag.DurationVar(&syncPeriod, "sync-period", 1*time.Hour, "The minimum frequency at which watched resources are reconciled")
+	flag.DurationVar(&syncPeriod, "sync-period", 0, "The minimum frequency at which watched resources are reconciled (0 or negative disables periodic sync)")
 
 	// Configure logging
 	klogFlagSet := goflag.NewFlagSet("klog", goflag.ExitOnError)
@@ -70,13 +70,22 @@ func run(ctx context.Context) error {
 	ctx = klog.NewContext(ctx, setupLog)
 	ctrl.SetLogger(klog.NewKlogr())
 
-	setupLog.Info("Creating manager")
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	var syncPeriodOpt *time.Duration
+	if syncPeriod > 0 {
+		syncPeriodOpt = &syncPeriod
+	}
+
+	mgrOpts := ctrl.Options{
 		Scheme: scheme,
-		Cache: cache.Options{
-			SyncPeriod: &syncPeriod,
-		},
-	})
+	}
+	if syncPeriodOpt != nil {
+		mgrOpts.Cache = cache.Options{
+			SyncPeriod: syncPeriodOpt,
+		}
+	}
+
+	setupLog.Info("Creating manager")
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOpts)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		return err
@@ -88,7 +97,7 @@ func run(ctx context.Context) error {
 		Client:     mgr.GetClient(),
 		Scheme:     mgr.GetScheme(),
 		Manager:    mgr,
-		SyncPeriod: &syncPeriod,
+		SyncPeriod: syncPeriodOpt,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Syncer")
 		return err

@@ -45,6 +45,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -62,6 +63,7 @@ var (
 	mgrCancel          context.CancelFunc
 	faultInjector      *faultInjectingRoundTripper
 	testRemoteProvider *testConfigProvider
+	krmReconciler      *KRMSyncerReconciler
 )
 
 // destClusterName is the fake GKE cluster name that tests resolve to the
@@ -170,10 +172,14 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	testSyncPeriod := 2 * time.Second
 	// Start Manager in Source Cluster
 	mgr, err := ctrl.NewManager(cfgSource, ctrl.Options{
 		Metrics: metricsserver.Options{
 			BindAddress: "0",
+		},
+		Cache: cache.Options{
+			SyncPeriod: &testSyncPeriod,
 		},
 	})
 	if err != nil {
@@ -195,12 +201,14 @@ func TestMain(m *testing.M) {
 		},
 	}
 
-	if err := (&KRMSyncerReconciler{
+	krmReconciler = &KRMSyncerReconciler{
 		Client:               mgr.GetClient(),
 		Scheme:               mgr.GetScheme(),
 		Manager:              mgr,
 		RemoteConfigProvider: testRemoteProvider,
-	}).SetupWithManager(mgr); err != nil {
+		SyncPeriod:           &testSyncPeriod,
+	}
+	if err := krmReconciler.SetupWithManager(mgr); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to setup controller: %v\n", err)
 		os.Exit(1)
 	}
@@ -1017,23 +1025,27 @@ func TestSyncerRetryFailedStatus(t *testing.T) {
 }
 
 func TestSyncPeriodConfigurable(t *testing.T) {
-	// Verify command line flag definition, default and parsing
+	// 1. Verify command line flag definition, default (0 / disabled) and parsing
 	fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
 	var sp time.Duration
-	fs.DurationVar(&sp, "sync-period", 1*time.Hour, "The minimum frequency at which watched resources are reconciled")
-	assert.Equal(t, 1*time.Hour, sp, "default sync period should be 1h")
+	fs.DurationVar(&sp, "sync-period", 0, "The minimum frequency at which watched resources are reconciled (0 or negative disables periodic sync)")
+	assert.Equal(t, time.Duration(0), sp, "default sync period should be 0 (no frequent sync)")
 
 	err := fs.Parse([]string{"--sync-period=45m"})
 	assert.NoError(t, err)
 	assert.Equal(t, 45*time.Minute, sp, "sync period should be configurable")
 
-	// Verify that SyncPeriod is passed to remote cluster cache options
-	syncPeriod := 30 * time.Minute
+	err = fs.Parse([]string{"--sync-period=-1s"})
+	assert.NoError(t, err)
+	assert.True(t, sp <= 0, "negative sync period should disable periodic sync")
+
+	// 2. Verify that SyncPeriod is passed to remote cluster cache options in KRMSyncerReconciler
+	syncPeriodRemote := 30 * time.Minute
 	r := &KRMSyncerReconciler{
 		Scheme:               scheme.Scheme,
 		RemoteConfigProvider: testRemoteProvider,
 		RemoteClusters:       make(map[string]cluster.Cluster),
-		SyncPeriod:           &syncPeriod,
+		SyncPeriod:           &syncPeriodRemote,
 	}
 
 	remoteConfig := testRemote(destClusterName)
@@ -1041,4 +1053,97 @@ func TestSyncPeriodConfigurable(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, c)
 	assert.NotNil(t, c.GetCache())
+
+	// 3. E2E test showcasing that sync period works to retry an error:
+	// A sync fails due to destination error, then recovers, retries, and succeeds.
+	// Furthermore, when destination state is deleted out-of-band while source is untouched,
+	// the periodic cache resync automatically triggers reconciliation and restores destination state.
+	ctx := t.Context()
+	ns := "sync-period-e2e-ns"
+	srcNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, k8sClientSource.Create(ctx, srcNamespace))
+	defer func() { _ = k8sClientSource.Delete(ctx, srcNamespace) }()
+
+	// Ensure injector is clean
+	faultInjector.failPatch.Store(false)
+	faultInjector.failDelete.Store(false)
+	faultInjector.failStatus.Store(false)
+
+	targetServiceName := "target-service-sync-period"
+	initialFailures := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationApply))
+
+	// Enable patch failure on destination to simulate error
+	faultInjector.failPatch.Store(true)
+	defer faultInjector.failPatch.Store(false)
+
+	// Create a KRMSyncer rule targeting dest-retry
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: "syncer-sync-period", Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote(destRetryClusterName),
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "", Version: "v1", Kind: "Service",
+					Namespaces: []string{ns},
+					SyncFields: []string{"spec"},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+	defer func() { _ = k8sClientSource.Delete(ctx, syncer) }()
+
+	// Create Service in Source
+	target := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 8080}},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, target))
+	defer func() { _ = k8sClientSource.Delete(ctx, target) }()
+
+	// Wait until failure metric has incremented due to destination error
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		current := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationApply))
+		return current > initialFailures, nil
+	})
+	require.NoError(t, err, "Failure metric for Service apply should increment")
+
+	// Destination service should not exist while apply is failing
+	destSvc := &corev1.Service{}
+	err = k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
+	require.True(t, errors.IsNotFound(err), "Service should not exist on dest while apply is failing")
+
+	// Recover destination: allow apply to succeed
+	faultInjector.failPatch.Store(false)
+
+	// Verify Service is retried and successfully synced to destination
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
+		if err != nil {
+			return false, nil
+		}
+		return len(destSvc.Spec.Ports) > 0 && destSvc.Spec.Ports[0].Port == 8080, nil
+	})
+	require.NoError(t, err, "Service should be retried and synced to destination")
+
+	// Now prove that the sync period setting works to resync when state is lost on destination
+	// without any updates to the source object:
+	// Delete Service directly on destination
+	require.NoError(t, k8sClientDest.Delete(ctx, destSvc))
+	err = k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
+	require.True(t, errors.IsNotFound(err), "Service should be deleted on destination")
+
+	// Do NOT touch the source Service. The cache resync (SyncPeriod: 2s) will trigger reconciliation
+	// and automatically recreate / re-apply the Service to destination.
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
+		if err != nil {
+			return false, nil
+		}
+		return len(destSvc.Spec.Ports) > 0 && destSvc.Spec.Ports[0].Port == 8080, nil
+	})
+	assert.NoError(t, err, "SyncPeriod should automatically trigger cache resync and restore destination object")
 }
