@@ -20,6 +20,7 @@ import (
 	"fmt"
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"os"
+	"time"
 
 	"k8s.io/klog/v2"
 
@@ -30,6 +31,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 
 	krmSyncer "github.com/gke-labs/kube-etl/syncer/controllers"
 )
@@ -54,6 +56,9 @@ func main() {
 }
 
 func run(ctx context.Context) error {
+	var syncPeriod time.Duration
+	flag.DurationVar(&syncPeriod, "sync-period", 1*time.Hour, "The minimum frequency at which watched resources are reconciled")
+
 	// Configure logging
 	klogFlagSet := goflag.NewFlagSet("klog", goflag.ExitOnError)
 	klog.InitFlags(klogFlagSet)
@@ -68,6 +73,9 @@ func run(ctx context.Context) error {
 	setupLog.Info("Creating manager")
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
+		Cache: cache.Options{
+			SyncPeriod: &syncPeriod,
+		},
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -77,9 +85,10 @@ func run(ctx context.Context) error {
 	// Create and set up the SyncerReconciler
 	setupLog.Info("Creating SyncerReconciler")
 	if err = (&krmSyncer.KRMSyncerReconciler{
-		Client:  mgr.GetClient(),
-		Scheme:  mgr.GetScheme(),
-		Manager: mgr,
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		Manager:    mgr,
+		SyncPeriod: &syncPeriod,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Syncer")
 		return err

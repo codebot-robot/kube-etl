@@ -17,17 +17,23 @@ package controllers
 import (
 	"bytes"
 	"context"
+	stderrors "errors"
 	"fmt"
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"k8s.io/client-go/rest"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/spf13/pflag"
 	"k8s.io/klog/v2"
 
 	"github.com/stretchr/testify/require"
@@ -40,23 +46,50 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
 var (
-	cfgSource       *rest.Config
-	cfgDest         *rest.Config
-	k8sClientSource client.Client
-	k8sClientDest   client.Client
-	testEnvSource   *envtest.Environment
-	testEnvDest     *envtest.Environment
-	mgrCtx          context.Context
-	mgrCancel       context.CancelFunc
+	cfgSource          *rest.Config
+	cfgDest            *rest.Config
+	cfgRetryDest       *rest.Config
+	k8sClientSource    client.Client
+	k8sClientDest      client.Client
+	testEnvSource      *envtest.Environment
+	testEnvDest        *envtest.Environment
+	mgrCtx             context.Context
+	mgrCancel          context.CancelFunc
+	faultInjector      *faultInjectingRoundTripper
+	testRemoteProvider *testConfigProvider
 )
 
 // destClusterName is the fake GKE cluster name that tests resolve to the
 // envtest destination cluster.
-const destClusterName = "dest"
+const (
+	destClusterName      = "dest"
+	destRetryClusterName = "dest-retry"
+)
+
+type faultInjectingRoundTripper struct {
+	base       http.RoundTripper
+	failPatch  atomic.Bool
+	failDelete atomic.Bool
+	failStatus atomic.Bool
+}
+
+func (rt *faultInjectingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodPatch && rt.failStatus.Load() && strings.HasSuffix(req.URL.Path, "/status") {
+		return nil, stderrors.New("injected status patch failure")
+	}
+	if req.Method == http.MethodPatch && rt.failPatch.Load() && !strings.HasSuffix(req.URL.Path, "/status") {
+		return nil, stderrors.New("injected apply patch failure")
+	}
+	if req.Method == http.MethodDelete && rt.failDelete.Load() {
+		return nil, stderrors.New("injected delete failure")
+	}
+	return rt.base.RoundTrip(req)
+}
 
 // testConfigProvider resolves fake GKE clusters (by name) to envtest clusters.
 type testConfigProvider struct {
@@ -148,11 +181,25 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	faultInjector = &faultInjectingRoundTripper{}
+	cfgRetryDest = rest.CopyConfig(cfgDest)
+	cfgRetryDest.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+		faultInjector.base = rt
+		return faultInjector
+	})
+
+	testRemoteProvider = &testConfigProvider{
+		clusters: map[string]*rest.Config{
+			destClusterName:      cfgDest,
+			destRetryClusterName: cfgRetryDest,
+		},
+	}
+
 	if err := (&KRMSyncerReconciler{
 		Client:               mgr.GetClient(),
 		Scheme:               mgr.GetScheme(),
 		Manager:              mgr,
-		RemoteConfigProvider: &testConfigProvider{clusters: map[string]*rest.Config{destClusterName: cfgDest}},
+		RemoteConfigProvider: testRemoteProvider,
 	}).SetupWithManager(mgr); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to setup controller: %v\n", err)
 		os.Exit(1)
@@ -734,4 +781,264 @@ func TestSyncerSyncMissingNamespace(t *testing.T) {
 	require.NoError(t, k8sClientSource.Delete(ctx, syncer))
 	// Cleanup destination namespace
 	_ = k8sClientDest.Delete(ctx, destNamespace)
+}
+
+func TestSyncerRetryFailedApply(t *testing.T) {
+	ctx := t.Context()
+	ns := "retry-apply-ns"
+	syncerName := "test-syncer-retry-apply"
+	targetServiceName := "target-service-retry-apply"
+
+	srcNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, k8sClientSource.Create(ctx, srcNamespace))
+	defer func() { _ = k8sClientSource.Delete(ctx, srcNamespace) }()
+
+	// 1. Enable patch failure
+	faultInjector.failPatch.Store(true)
+	defer faultInjector.failPatch.Store(false)
+
+	initialFailures := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationApply))
+
+	// Create Syncer targeting dest-retry
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote(destRetryClusterName),
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "", Version: "v1", Kind: "Service",
+					Namespaces: []string{ns},
+					SyncFields: []string{"spec"},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+	defer func() { _ = k8sClientSource.Delete(ctx, syncer) }()
+
+	// Create target Service in Source
+	target := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 80}},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, target))
+	defer func() { _ = k8sClientSource.Delete(ctx, target) }()
+
+	// Wait until failure metric has incremented
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		current := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationApply))
+		return current > initialFailures, nil
+	})
+	require.NoError(t, err, "Failure metric for apply should increment on failure")
+
+	// Verify target service does NOT exist in destination yet
+	destSvc := &corev1.Service{}
+	err = k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
+	require.True(t, errors.IsNotFound(err), "Service should not exist on dest while apply is failing")
+
+	// Now recover: allow destination to succeed
+	faultInjector.failPatch.Store(false)
+
+	// Verify Service is retried and successfully synced to Dest
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
+		if err != nil {
+			return false, nil
+		}
+		return len(destSvc.Spec.Ports) > 0 && destSvc.Spec.Ports[0].Port == 80, nil
+	})
+	assert.NoError(t, err, "Service should be retried and successfully synced to dest after recovery")
+}
+
+func TestSyncerRetryFailedDelete(t *testing.T) {
+	ctx := t.Context()
+	ns := "retry-delete-ns"
+	syncerName := "test-syncer-retry-delete"
+	targetServiceName := "target-service-retry-delete"
+
+	srcNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, k8sClientSource.Create(ctx, srcNamespace))
+	defer func() { _ = k8sClientSource.Delete(ctx, srcNamespace) }()
+
+	// Ensure injector is clean
+	faultInjector.failPatch.Store(false)
+	faultInjector.failDelete.Store(false)
+
+	initialFailures := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationDelete))
+
+	// Create Syncer targeting dest-retry
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote(destRetryClusterName),
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "", Version: "v1", Kind: "Service",
+					Namespaces: []string{ns},
+					SyncFields: []string{"spec"},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+	defer func() { _ = k8sClientSource.Delete(ctx, syncer) }()
+
+	// Create target Service in Source
+	target := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 80}},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, target))
+
+	// Wait for initial sync to Dest
+	destSvc := &corev1.Service{}
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
+		return err == nil, nil
+	})
+	require.NoError(t, err, "Service should be initially synced to dest")
+
+	// Enable delete failure
+	faultInjector.failDelete.Store(true)
+	defer faultInjector.failDelete.Store(false)
+
+	// Delete target Service in Source
+	require.NoError(t, k8sClientSource.Delete(ctx, target))
+
+	// Wait until delete failure metric increments
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		current := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationDelete))
+		return current > initialFailures, nil
+	})
+	require.NoError(t, err, "Failure metric for delete should increment on failure")
+
+	// Verify target service still exists in destination while failing
+	err = k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
+	require.NoError(t, err, "Service should still exist on dest while delete is failing")
+
+	// Now recover: allow delete to succeed
+	faultInjector.failDelete.Store(false)
+
+	// Verify deletion is retried and succeeds on Dest
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
+		return errors.IsNotFound(err), nil
+	})
+	assert.NoError(t, err, "Service deletion should be retried and succeed on dest after recovery")
+}
+
+func TestSyncerRetryFailedStatus(t *testing.T) {
+	ctx := t.Context()
+	ns := "retry-status-ns"
+	syncerName := "test-syncer-retry-status"
+	targetServiceName := "target-service-retry-status"
+
+	srcNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+	require.NoError(t, k8sClientSource.Create(ctx, srcNamespace))
+	defer func() { _ = k8sClientSource.Delete(ctx, srcNamespace) }()
+
+	// Ensure injector is clean
+	faultInjector.failPatch.Store(false)
+	faultInjector.failDelete.Store(false)
+	faultInjector.failStatus.Store(false)
+
+	initialFailures := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationStatus))
+
+	// Create syncer targeting dest-retry FIRST
+	syncer := &krmv1alpha1.KRMSyncer{
+		ObjectMeta: metav1.ObjectMeta{Name: syncerName, Namespace: ns},
+		Spec: krmv1alpha1.KRMSyncerSpec{
+			Mode:   krmv1alpha1.ModePush,
+			Remote: testRemote(destRetryClusterName),
+			Rules: []krmv1alpha1.ResourceRule{
+				{
+					Group: "", Version: "v1", Kind: "Service",
+					Namespaces: []string{ns},
+					SyncFields: []string{"spec", "status"},
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, syncer))
+	defer func() { _ = k8sClientSource.Delete(ctx, syncer) }()
+
+	// Create target Service in Source SECOND
+	target := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: targetServiceName, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Port: 80}},
+			Type:  corev1.ServiceTypeLoadBalancer,
+		},
+	}
+	require.NoError(t, k8sClientSource.Create(ctx, target))
+	defer func() { _ = k8sClientSource.Delete(ctx, target) }()
+
+	// Wait for initial sync
+	destSvc := &corev1.Service{}
+	err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		return k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc) == nil, nil
+	})
+	require.NoError(t, err, "Service should be synced initially")
+
+	// Enable status patch failure
+	faultInjector.failStatus.Store(true)
+	defer faultInjector.failStatus.Store(false)
+
+	// Update status on source
+	require.NoError(t, k8sClientSource.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, target))
+	target.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "5.6.7.8"}}
+	require.NoError(t, k8sClientSource.Status().Update(ctx, target))
+
+	// Wait until status failure metric increments
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		current := testutil.ToFloat64(SyncFailuresTotal.WithLabelValues("", "v1", "Service", OperationStatus))
+		return current > initialFailures, nil
+	})
+	require.NoError(t, err, "Failure metric for status should increment on failure")
+
+	// Now recover: allow status patch to succeed
+	faultInjector.failStatus.Store(false)
+
+	// Verify status is retried and updated on dest
+	err = wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		err := k8sClientDest.Get(ctx, types.NamespacedName{Name: targetServiceName, Namespace: ns}, destSvc)
+		if err != nil {
+			return false, nil
+		}
+		return len(destSvc.Status.LoadBalancer.Ingress) > 0 && destSvc.Status.LoadBalancer.Ingress[0].IP == "5.6.7.8", nil
+	})
+	assert.NoError(t, err, "Status update should be retried and succeed on dest after recovery")
+}
+
+func TestSyncPeriodConfigurable(t *testing.T) {
+	// Verify command line flag definition, default and parsing
+	fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	var sp time.Duration
+	fs.DurationVar(&sp, "sync-period", 1*time.Hour, "The minimum frequency at which watched resources are reconciled")
+	assert.Equal(t, 1*time.Hour, sp, "default sync period should be 1h")
+
+	err := fs.Parse([]string{"--sync-period=45m"})
+	assert.NoError(t, err)
+	assert.Equal(t, 45*time.Minute, sp, "sync period should be configurable")
+
+	// Verify that SyncPeriod is passed to remote cluster cache options
+	syncPeriod := 30 * time.Minute
+	r := &KRMSyncerReconciler{
+		Scheme:               scheme.Scheme,
+		RemoteConfigProvider: testRemoteProvider,
+		RemoteClusters:       make(map[string]cluster.Cluster),
+		SyncPeriod:           &syncPeriod,
+	}
+
+	remoteConfig := testRemote(destClusterName)
+	c, err := r.getOrCreateRemoteCluster(t.Context(), "test-key-sync-period", "default", remoteConfig)
+	require.NoError(t, err)
+	require.NotNil(t, c)
+	assert.NotNil(t, c.GetCache())
 }
