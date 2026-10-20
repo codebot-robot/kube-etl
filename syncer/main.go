@@ -20,6 +20,7 @@ import (
 	"fmt"
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"os"
+	"time"
 
 	"k8s.io/klog/v2"
 
@@ -30,6 +31,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 
 	krmSyncer "github.com/gke-labs/kube-etl/syncer/controllers"
 )
@@ -54,6 +56,9 @@ func main() {
 }
 
 func run(ctx context.Context) error {
+	var syncPeriod time.Duration
+	flag.DurationVar(&syncPeriod, "sync-period", 0, "The minimum frequency at which watched resources are reconciled (0 or negative disables periodic sync)")
+
 	// Configure logging
 	klogFlagSet := goflag.NewFlagSet("klog", goflag.ExitOnError)
 	klog.InitFlags(klogFlagSet)
@@ -65,10 +70,22 @@ func run(ctx context.Context) error {
 	ctx = klog.NewContext(ctx, setupLog)
 	ctrl.SetLogger(klog.NewKlogr())
 
-	setupLog.Info("Creating manager")
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	var syncPeriodOpt *time.Duration
+	if syncPeriod > 0 {
+		syncPeriodOpt = &syncPeriod
+	}
+
+	mgrOpts := ctrl.Options{
 		Scheme: scheme,
-	})
+	}
+	if syncPeriodOpt != nil {
+		mgrOpts.Cache = cache.Options{
+			SyncPeriod: syncPeriodOpt,
+		}
+	}
+
+	setupLog.Info("Creating manager")
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOpts)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		return err
@@ -77,9 +94,10 @@ func run(ctx context.Context) error {
 	// Create and set up the SyncerReconciler
 	setupLog.Info("Creating SyncerReconciler")
 	if err = (&krmSyncer.KRMSyncerReconciler{
-		Client:  mgr.GetClient(),
-		Scheme:  mgr.GetScheme(),
-		Manager: mgr,
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		Manager:    mgr,
+		SyncPeriod: syncPeriodOpt,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Syncer")
 		return err

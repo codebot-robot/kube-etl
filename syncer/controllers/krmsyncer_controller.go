@@ -16,6 +16,7 @@ package controllers
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	krmv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -57,7 +58,10 @@ type KRMSyncerReconciler struct {
 	// remoteClients caches Push mode destination clients, shared by all
 	// push watchers.
 	remoteClients *remoteClientCache
-	mu            sync.RWMutex
+	// SyncPeriod determines the minimum frequency at which watched resources are reconciled
+	// in remote cluster caches.
+	SyncPeriod *time.Duration
+	mu         sync.RWMutex
 }
 
 type RemoteGVK struct {
@@ -326,6 +330,9 @@ func (r *KRMSyncerReconciler) getOrCreateRemoteCluster(ctx context.Context, key,
 
 	c, err := cluster.New(restConfig, func(o *cluster.Options) {
 		o.Scheme = r.Scheme
+		if r.SyncPeriod != nil && *r.SyncPeriod > 0 {
+			o.Cache.SyncPeriod = r.SyncPeriod
+		}
 	})
 	if err != nil {
 		return nil, err
@@ -410,6 +417,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
+	var syncErrors []error
 	for _, krmsyncer := range krmsyncers.Items {
 		if krmsyncer.Spec.Suspend {
 			continue
@@ -459,6 +467,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				destClient, err = r.getRemoteClient(ctx, &krmsyncer)
 				if err != nil {
 					logger.Error(err, "Failed to get remote client")
+					syncErrors = append(syncErrors, err)
 					continue
 				}
 			} else {
@@ -477,6 +486,8 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 					if !errors.IsNotFound(err) {
 						// TODO: report failure in syncer status
 						logger.Error(err, "Failed to delete resource on destination cluster")
+						recordSyncFailure(r.GVK, OperationDelete)
+						syncErrors = append(syncErrors, err)
 					}
 				}
 				continue
@@ -490,6 +501,7 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			if err != nil {
 				// TODO: report failure in syncer status
 				logger.Error(err, "Failed to filter fields")
+				syncErrors = append(syncErrors, err)
 				continue
 			}
 
@@ -502,12 +514,13 @@ func (r *DynamicResourceReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			if err := r.applyToDestination(ctx, destClient, destObj); err != nil {
 				// TODO: report failure in syncer status
 				logger.Error(err, "Failed to apply to destination cluster")
+				syncErrors = append(syncErrors, err)
 			} else {
 				logger.Info("Successfully synced resource to destination cluster", "name", u.GetName(), "namespace", u.GetNamespace())
 			}
 		}
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, stderrors.Join(syncErrors...)
 }
 
 func (r *DynamicResourceReconciler) getRemoteClient(ctx context.Context, krmsyncer *krmv1alpha1.KRMSyncer) (client.Client, error) {
@@ -577,9 +590,11 @@ func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, dest
 					},
 				}
 				if err := destClient.Create(ctx, ns); err != nil {
+					recordSyncFailure(r.GVK, OperationApply)
 					return fmt.Errorf("failed to create destination namespace %q: %v", nsName, err)
 				}
 			} else {
+				recordSyncFailure(r.GVK, OperationApply)
 				return fmt.Errorf("failed to check destination namespace %q: %v", nsName, err)
 			}
 		}
@@ -591,11 +606,13 @@ func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, dest
 
 	status, found, err := unstructured.NestedFieldCopy(obj.Object, "status")
 	if err != nil {
+		recordSyncFailure(r.GVK, OperationApply)
 		return fmt.Errorf("failed to copy status: %v", err)
 	}
 
 	// Use Server-Side Apply (SSA) to create or update the resource.
 	if err := destClient.Patch(ctx, obj, client.Apply, patchOpts...); err != nil {
+		recordSyncFailure(r.GVK, OperationApply)
 		return fmt.Errorf("failed to apply object to destination: %v", err)
 	}
 
@@ -617,6 +634,7 @@ func (r *DynamicResourceReconciler) applyToDestination(ctx context.Context, dest
 			client.FieldOwner("krm-syncer"),
 		}
 		if err := destClient.Status().Patch(ctx, statusObj, client.Apply, subResourcePatchOpts...); err != nil {
+			recordSyncFailure(r.GVK, OperationStatus)
 			return fmt.Errorf("failed to apply status subresource to destination: %v", err)
 		}
 	}
